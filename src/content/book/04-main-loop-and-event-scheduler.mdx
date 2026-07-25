@@ -1,0 +1,563 @@
+---
+title: "The Main Loop and Event Scheduler"
+description: "Traces main() through DOSBOX_RunMachine(), Normal_Loop(), and PIC_RunQueue() in execution order. The CPU only runs as many cycles as fit before the next scheduled event, drawn from a fractional-tick event queue that every emulated device shares."
+order: 4
+chapterSlug: "main-loop-and-event-scheduler"
+part: "foundations"
+---
+import Diagram from '../../components/Diagram.astro';
+
+# Chapter 4 — The Main Loop and Event Scheduler {#chapter-4-the-main-loop-and-event-scheduler}
+
+*(Source references below are against `joncampbell123/dosbox-x`, commit `192c1756`, cloned 2026-07-25. File/line numbers will drift as the project moves; treat them as coordinates into a moving target, not fixed citations.)*
+
+## 4.1 Introduction
+
+The question @chapter(time-in-dosbox-x, short) left open — how DOSBox-X knows exactly when to stop executing the CPU so a scheduled event can occur — has a one-line answer: before every CPU burst, `PIC_RunQueue()` converts the soonest-due event's fractional-tick deadline into a precise cycle budget, hands the decoder exactly that many cycles, and lets it run only until the budget is exhausted, at which point the scheduler fires the event and the loop continues. This chapter opens `src/gui/sdlmain.cpp` at `main()` and traces that handoff to its source.
+
+It's worth being precise about what "the scheduler" means here before going any further, because it's easy to read a chapter like this and come away picturing something more active than it is. The scheduler — `PIC_RunQueue()`, and the machinery around it this chapter traces — does not execute hardware, and it does not run devices. It computes two things, a due/not-due answer and a cycle count, and then gets out of the way. The CPU decoder is what actually runs; a device's own handler function is what actually reacts. The scheduler's entire job is deciding *when* control passes between them. Keep that division of labor in mind throughout: every time this chapter says "the scheduler does X," X is almost always "compute a number," never "perform an effect."
+
+Once initialization is complete, DOSBox-X's primary task is no longer constructing an emulated PC—it is advancing one. Every component of the virtual machine, including the CPU, programmable interrupt controller (PIC), programmable interval timer (PIT), DMA controller, video hardware, sound devices, and input system, must progress together while preserving the timing relationships expected by the software running inside the emulator. Unlike a physical computer, where these devices operate concurrently, DOSBox-X coordinates them through a single execution loop.
+
+The central challenge is not simply executing instructions, but executing them at the correct simulated time. The CPU may execute millions of emulated instructions per second, while hardware devices generate interrupts, timers expire, audio buffers complete, and display hardware refreshes at fixed real-world intervals. These activities cannot proceed independently; they must remain synchronized so that each device observes the same virtual timeline regardless of the host machine's performance or the configured CPU speed.
+
+DOSBox-X addresses this problem by separating **CPU execution** from **device timing**. The processor advances in units of emulated CPU cycles, while hardware events are scheduled in fixed millisecond-based time. The scheduler continuously converts between these two domains, allowing the CPU to execute only until the next hardware event becomes due before servicing it and resuming execution. This separation is the key architectural principle that allows changing the `cycles=` setting to alter CPU performance without affecting the timing of hardware events such as VGA retraces, timer interrupts, or Sound Blaster delays.
+
+This chapter follows that mechanism from the moment the emulator enters its main execution loop. Beginning with `main()`, we trace control through the CPU decoder, the PIC event scheduler, and the timer subsystem to show how DOSBox-X coordinates instruction execution, interrupt delivery, and hardware events into a single, coherent simulation of a running PC.
+
+One qualification worth stating up front, so it doesn't come as a surprise later: "the CPU runs until the next scheduled event" describes the *normal* path, not the *only* path. A CPU burst can also end early because of a guest exception, a debugger breakpoint, a callback (an `INT`-style trap into C++ code), a mode change (real mode to protected mode and back), or — for the dynamic recompiler covered in @chapter(dynamic-recompilation, short) — a core switch. All of these are uncommon relative to ordinary scheduled-event boundaries, and none of them change the architecture this chapter describes; they're simply additional reasons a batch can be shorter than its nominal cycle budget. They'll each get their own treatment in the chapters where they're actually relevant.
+
+## 4.2 Why This Chapter Comes Before the CPU {#why-this-chapter-comes-before-the-cpu}
+
+@chapter(interpreter-core, short) and @chapter(dynamic-recompilation, short) cover the CPU core — the interpreter and the dynamic recompiler that decode and execute x86 instructions. Both assume something this chapter hasn't established yet: that the CPU never runs on its own terms. It is invoked, handed a specific number of cycles, and stopped, by something else.
+
+That something else is what this chapter traces. Once it's clear what decides how much the CPU gets to run and when, the CPU chapters that follow are chapters about a component that takes orders, not one that drives the machine.
+
+## 4.3 From `main()` to the First Instruction {#from-main-to-the-first-instruction}
+
+`main()` lives in `src/gui/sdlmain.cpp` — the entry point sits in the SDL frontend file even though most of what it sets up belongs to the CPU/device emulator, a naming artifact inherited from DOSBox's original single-frontend design. Startup proceeds:
+
+1. Parse command line arguments (`DOSBOX_parse_argv`)
+2. Bring up early logging (`LOG::EarlyInit`)
+3. Build the `Config` object and register config sections for every subsystem — CPU, VGA, sound cards, serial, DOS kernel — each gets a chance to register its `.conf` keys before anything is instantiated
+4. Call `DOSBOX_RunMachine()`
+
+That call is the boundary. Nothing before it involves the CPU or a single emulated device; everything after it, for the rest of this chapter and most of this book, does.
+
+## 4.4 `DOSBOX_RunMachine`: The Loop of Loops {#dosbox-runmachine-the-loop-of-loops}
+
+```cpp
+void DOSBOX_RunMachine(void){
+    Bitu ret;
+    do {
+        ret = (*loop)();
+    } while (!ret);
+}
+```
+
+At first glance, `DOSBOX_RunMachine()` appears to be little more than a wrapper around the CPU. It repeatedly invokes a function pointer named `loop` until the handler returns non-zero. That's the entire function.
+
+The next few functions explain why that impression is misleading.
+
+## 4.5 Installing the Execution Loop {#installing-the-execution-loop}
+
+If `loop` is just a function pointer, two questions follow immediately: what installs it, and does anything else ever take it over mid-run?
+
+```cpp
+typedef Bitu (LoopHandler)(void);
+static LoopHandler* loop;
+```
+
+`DOSBOX_SetLoop()` (`src/dosbox.cpp`) is the only way to change it, and it's called once at startup:
+
+```cpp
+DOSBOX_SetLoop(&Normal_Loop);
+```
+
+Searching the rest of the codebase for other callers turns up exactly one: the interactive debugger, present only in `C_DEBUG` builds. `DEBUG_EnableDebugger()` (`src/debug/debug.cpp`) records whatever was installed before it, then swaps `loop` to `DEBUG_Loop`:
+
+```cpp
+LoopHandler *ol = DOSBOX_GetLoop();
+if (ol != DEBUG_Loop) old_loop = ol;
+...
+DOSBOX_SetLoop(&DEBUG_Loop);
+```
+
+So there is a second `LoopHandler` — but look at what it actually does while the machine is running:
+
+```cpp
+Bitu DEBUG_Loop(void) {
+    if (debug_running) {
+        // periodically redraw the debugger UI
+        return old_loop();   // typically Normal_Loop
+    } else {
+        // single-step / breakpoint-wait UI logic; no cpudecoder call here
+        ...
+    }
+}
+```
+
+`DEBUG_Loop` only takes over loop execution while the debugger is paused — single-stepping, or stopped at a breakpoint. The moment the machine is actually running, it forwards straight back to `old_loop()`. Swapping the handler didn't change what runs the machine; it added a layer that steps out of the way as soon as the machine is doing anything.
+
+That leaves an expectation worth holding onto. `LoopHandler` exists, `DOSBOX_SetLoop()` exists, and nothing stops another subsystem from using them. It would be reasonable to assume that rebooting the virtual machine, or booting a different guest OS, works the same way — install a different handler for a different mode. Keep that assumption in mind; @section(main-loop-and-event-scheduler/exceptional-control-flow, short) checks it directly.
+
+## 4.6 `Normal_Loop` {#normal-loop}
+
+So what does `Normal_Loop` actually do? `Normal_Loop` (`src/dosbox.cpp`) updates title-bar cycle/tick-rate reporting, then enters its body:
+
+```cpp
+try {
+    while (1) {
+        if (PIC_RunQueue()) {
+            CPU_Check_NMI();
+            ret = (*cpudecoder)();
+            if (ret < 0) return 1;
+            if (ret > 0) {
+                // dispatch to CallBack_Handlers[ret]
+                ...
+            }
+        } else {
+            GFX_Events();
+            if (!DOSBox_Paused() && ticksRemain > 0) {
+                TIMER_AddTick();
+                ticksRemain--;
+            } else {
+                increaseticks();
+                return 0;
+            }
+        }
+    }
+} catch (int x) {
+    // exceptional control flow
+}
+```
+
+One call decides which branch runs on every pass through this loop: `PIC_RunQueue()`. It returns `true` when the CPU still has cycles left to spend in the current millisecond, `false` once they're exhausted.
+
+**When it returns `true`** — the CPU path — `(*cpudecoder)()` runs one batch of instructions (the interpreter or dynamic core, covered in @chapter(interpreter-core, short)–@chapter(dynamic-recompilation, short)). A negative return stops `Normal_Loop` outright. A positive return is a callback ID: the decoder hit an interrupt stub or I/O trap that needs C++ code instead of guest instructions, and `Normal_Loop` dispatches to `CallBack_Handlers[ret]`.
+
+**When it returns `false`** — the host path — the CPU has used its cycle budget for this millisecond. `GFX_Events()` pumps host input and window events, `TIMER_AddTick()` advances the millisecond clock if any ticks remain, and otherwise `increaseticks()` runs and `Normal_Loop` returns to `DOSBOX_RunMachine`, which immediately calls it again.
+
+Neither branch is optional and neither runs without asking `PIC_RunQueue()` first. Whatever that function actually decides, it decides for every single instruction the guest ever executes.
+
+## 4.7 `PIC_RunQueue` {#pic-runqueue}
+
+Here's the question that matters: how does DOSBox-X stop the CPU from running straight past the next VGA retrace, PIT tick, or DMA completion? Nothing in `Normal_Loop` polls for those events directly — it just asks `PIC_RunQueue()` a yes/no question. The answer has to be coming from somewhere.
+
+`PIC_RunQueue` (`src/hardware/pic.cpp` — the same file that owns the event queue this whole chapter revolves around, alongside the emulated 8259 covered in @chapter(interrupts-exceptions-pic)) reads, going in, like an interrupt-controller helper — the file also contains the emulated 8259 (`PIC_Controller`, IRQ masking, cascade logic), and "PIC" is the 8259's name. By the end of this function that reading turns out to be incomplete.
+
+It does three things, in order, on every call.
+
+**1. Rolls unspent cycles forward.**
+
+```cpp
+// src/hardware/pic.cpp, top of PIC_RunQueue()
+CPU_CycleLeft += CPU_Cycles;
+CPU_Cycles = 0;
+```
+
+Whatever `CPU_Cycles` still held from the previous batch — including a batch that stopped early because a callback fired — is folded into `CPU_CycleLeft` instead of discarded. Everything below this operates on `CPU_CycleLeft`, never on the previous `CPU_Cycles`.
+
+**2. Dispatches expired events.**
+
+It's worth fixing a piece of vocabulary here, because the rest of this chapter and the next few sections lean on it: putting an entry into `pic_queue` (§4.8's subject) is **enqueuing** it; pulling a due entry back out and calling its handler, which is what this step does, is **dispatching** it. They're deliberately different verbs for a reason — enqueuing can happen from almost anywhere, including from inside a handler that's itself being dispatched right now (§4.8 covers exactly that case), while dispatching only ever happens here, in this one loop, and only for entries whose deadline has actually arrived. Confusing the two — thinking that scheduling an event and running it are the same moment — is the easiest way to misread this chapter.
+
+```cpp
+while (pic_queue.next_entry &&
+       (pic_queue.next_entry->index * CPU_CycleMax <= index_nd)) {
+    PICEntry * entry = pic_queue.next_entry;
+    pic_queue.next_entry = entry->next;
+    (entry->pic_event)(entry->value);
+    // return entry to free list
+}
+```
+
+`index_nd` — from `PIC_TickIndexND()` — is how far into the current millisecond execution has progressed, in cycle-equivalent units. `pic_queue` holds every device event currently scheduled: a VGA retrace, a DMA completion, a sound card IRQ, a serial byte. Each carries a fractional-tick `index`, and the queue stays sorted by that index (@section(main-loop-and-event-scheduler/event-scheduling, short)), so checking only the head is enough to know whether anything is due. Firing an entry calls its handler directly, synchronously — the handler runs to completion before `PIC_RunQueue` does anything else.
+
+`index_nd` is intentionally left in cycle units rather than fractional ticks so that it can be compared directly against `pic_queue.next_entry->index * CPU_CycleMax`, avoiding an unnecessary division during the scheduler's hot path. @section(main-loop-and-event-scheduler/two-clocks-one-conversion, short) makes that conversion — and the two unit systems it bridges — explicit.
+
+**3. Computes the next cycle budget.**
+
+```cpp
+if (pic_queue.next_entry) {
+    Bits cycles = (Bits)(pic_queue.next_entry->index * CPU_CycleMax - index_nd);
+    CPU_Cycles = (cycles < CPU_CycleLeft) ? cycles : CPU_CycleLeft;
+} else {
+    CPU_Cycles = CPU_CycleLeft;
+}
+```
+
+If another event is pending, the CPU gets exactly enough cycles to reach it, no more. If the queue is empty, it gets whatever remains of the millisecond's budget. Either way, the number handed to `(*cpudecoder)()` back in `Normal_Loop` was never the CPU's to choose.
+
+The return value is just "is there still a positive cycle budget?" — the yes/no `Normal_Loop` asked for.
+
+At this point the architecture becomes clear. The CPU never advances the machine independently. Every burst of execution is bounded by this function, computed before the decoder ever runs a single instruction — which makes the scheduler, not the CPU, the component that determines when the virtual machine changes state. The file's name undersold it: `PIC_RunQueue` is not an interrupt-controller helper that happens to also gate the CPU. Gating the CPU is the job.
+
+That gating has a cost that isn't fixed. `PIC_RunQueue` itself runs in roughly constant time — an O(1) budget recompute plus however many entries happen to be due, usually zero or a handful. What it hands off varies enormously: the CPU path that follows can consume anywhere from a handful of cycles' worth of host time to nearly a full millisecond, depending on the configured `cycles=` value and host speed, while the host path costs microseconds unless `increaseticks()` reaches an actual sleep (@section(main-loop-and-event-scheduler/advancing-simulated-time, short)). The function's own cost never changes; what it authorizes does.
+
+<Diagram src="03-3-cycle-budget-timeline.svg" />
+
+## 4.8 Event Scheduling {#event-scheduling}
+
+*A quick position check before this section: we're stepping one level sideways from the `main()` → `DOSBOX_RunMachine()` → `Normal_Loop()` → `PIC_RunQueue()` spine, not moving further down it. `PIC_RunQueue()`, just covered, only dispatches what's already sitting in `pic_queue`. Before returning to that spine, it's worth seeing where those entries get enqueued in the first place.*
+
+`PIC_RunQueue` only dispatches what's already in `pic_queue`. Where do those entries come from?
+
+```cpp
+void PIC_AddEvent(PIC_EventHandler handler, pic_tickindex_t delay, Bitu val) {
+    PICEntry * entry = pic_queue.free_entry;
+    if (InEventService) entry->index = delay + srv_lag;
+    else entry->index = delay + PIC_TickIndex();
+    entry->pic_event = handler;
+    entry->value = val;
+    pic_queue.free_entry = pic_queue.free_entry->next;
+    AddEntry(entry);   // insertion-sorted into the queue by index
+}
+```
+
+The entry pool is a fixed-size free list (`PICEntry entries[PIC_QUEUESIZE]`), not a dynamic allocation — no call into `PIC_AddEvent` can trigger `malloc`, which keeps device timing free of allocator jitter. `AddEntry` inserts the new entry in sorted position by `index`, which is exactly what let `PIC_RunQueue` get away with checking only the head of the queue in @section(main-loop-and-event-scheduler/pic-runqueue, short).
+
+Two entries with exactly the same `index` are a natural question, and it's worth answering precisely rather than leaving it implicit: `AddEntry` walks the list looking for the first existing entry whose index is *strictly greater* than the one being inserted, and stops there — which means a tie is never displaced. A new entry with the same `index` as entries already in the queue is inserted after all of them, not before, not at an arbitrary position. Ties resolve in insertion (enqueue) order, deterministically — which matters, because it's what makes a recorded input sequence replay identically twice in a row, down to which of two simultaneously-due events dispatches first.
+
+There's a second, easy-to-miss consequence of `AddEntry` worth flagging here, because it complicates a picture §4.7 left slightly too clean: cycle exhaustion isn't only something the CPU discovers for itself by counting down to zero. After inserting the new entry, `AddEntry` checks whether it's now sooner than whatever the CPU is currently mid-batch on, and if so, zeroes out `CPU_Cycles` right then:
+
+```cpp
+// src/hardware/pic.cpp, end of AddEntry()
+Bits cycles = PIC_MakeCycles(pic_queue.next_entry->index - PIC_TickIndex());
+if (cycles < CPU_Cycles) {
+    CPU_CycleLeft += CPU_Cycles;
+    CPU_Cycles = 0;
+}
+```
+
+This is what happens when a guest instruction *itself* schedules an event sooner than the batch it's currently running in — an `OUT` to a Sound Blaster DSP port that arms a DMA-completion event, say. The decoder's `while (CPU_Cycles-- > 0)` loop (§4.7) will see the budget hit zero on its very next check and return control to `Normal_Loop`, which calls `PIC_RunQueue()` again and recomputes a correct, shorter budget against the newly tightened deadline. So "`CPU_CycleLeft` reaches zero, then the scheduler runs" is the common case, but not the only trigger — a freshly enqueued event can retroactively shrink a batch that's already in flight, which is enqueuing reaching back to affect dispatch timing before the queue is ever checked again.
+
+The `InEventService`/`srv_lag` branch is easy to misread as an edge case. It isn't. If a handler currently being dispatched by step 2 of `PIC_RunQueue` calls `PIC_AddEvent` again — the ordinary case for a periodic event rearming itself — the new entry is scheduled relative to `srv_lag`, the index of the event being serviced, not relative to wherever the CPU actually happens to be right now. A rearming event is measured from when it was *supposed* to fire, not from whatever moment its handler happened to run. Without that distinction, a PIT channel rearming itself every handler invocation would drift a little further behind on every tick; with it, the schedule stays exact regardless of how long each handler took.
+
+Every hardware subsystem introduced later in this book eventually reaches this function. VGA schedules retrace events here. The PIT schedules timer expirations here. DMA schedules transfer completion here. The details differ by device; all of them join the same queue before control ever returns to the CPU.
+
+<Diagram src="03-2-event-queue-structure.svg" />
+
+## 4.9 Two Clocks, One Conversion {#two-clocks-one-conversion}
+
+@section(main-loop-and-event-scheduler/pic-runqueue, short) leaned on `index * CPU_CycleMax` without pausing on it, and @section(main-loop-and-event-scheduler/event-scheduling, short) introduced `PICEntry.index` without saying what unit it's actually in. Both deserve a straight answer, because the scheduler only becomes completely understandable once it's clear that it operates in two different units simultaneously — and everything from here through @section(main-loop-and-event-scheduler/completing-a-millisecond, short) is built on the one value that converts between them.
+
+The CPU executes **cycles**. `CPU_Cycles`, `CPU_CycleLeft`, and `CPU_CycleMax` all count work in CPU-cycle units.
+
+The event queue, however, is not measured in cycles at all. `PIC_Ticks` is a literal millisecond counter, and every `PICEntry.index` — together with the `delay` parameter passed to `PIC_AddEvent()` — is expressed as a fractional number of milliseconds from the current tick.
+
+The bridge between those two systems is a single value, declared in `src/cpu/cpu.cpp`:
+
+```cpp
+cpu_cycles_count_t CPU_CycleMax = 3000;
+```
+
+`CPU_CycleMax` means "how many emulated CPU cycles fit into one simulated millisecond." When the user changes `cycles=` (or the automatic cycle controller adjusts it — @chapter(timing-and-cycle-management)), this value changes, but the scheduler's notion of elapsed time does not.
+
+@section(time-in-dosbox-x/turning-work-into-simulated-time, short) already derived the two helper functions this conversion rests on — `PIC_TickIndex()`, which turns cycles consumed into a millisecond fraction, and `PIC_MakeCycles()`, its inverse, which turns a fractional-millisecond delay into a cycle count. Nothing about either function changes in the scheduler's hands; `pic_queue.next_entry->index * CPU_CycleMax` in @section(main-loop-and-event-scheduler/pic-runqueue, short) is exactly `PIC_MakeCycles()`, inlined.
+
+What the scheduler needs that §3.8 didn't: a version of `PIC_TickIndex()` that skips the division. `PIC_RunQueue()` compares a queue entry's deadline against cycles already consumed many times per millisecond, and doing that comparison in cycle units avoids a floating-point divide on every check. `include/pic.h` provides it alongside the two already covered:
+
+```cpp
+static INLINE Bits PIC_TickIndexND(void) {
+    return CPU_CycleMax-CPU_CycleLeft-CPU_Cycles;
+}
+```
+
+This is `PIC_TickIndex()`'s numerator on its own, undivided (`ND` — "no division") — cycles consumed so far this millisecond, left in cycle units instead of converted to a 0.0–1.0 fraction. That's exactly the form `index_nd` in @section(main-loop-and-event-scheduler/pic-runqueue, short) needs.
+
+For example, the Sound Blaster DSP reset examined in @section(sound/the-dsp-commands-not-a-direct-line-to-audio, short) schedules a delay of `20.0f/1000.0f`, representing 20 μs, or 0.02 ms. With the default `CPU_CycleMax = 3000`, the conversion is simply:
+
+```
+0.02 ms × 3000 cycles/ms = 60 cycles
+```
+
+If the emulator later doubles `CPU_CycleMax`, the same 20 μs delay automatically becomes 120 cycles. The device timing has not changed — only the amount of CPU work that now fits into the same simulated interval.
+
+It's worth pausing on why events are scheduled to sub-millisecond, fractional precision at all, rather than rounding everything to the nearest whole tick — that 20 μs Sound Blaster delay is, after all, two hundredths of a millisecond. If `PICEntry.index` only had millisecond granularity, every event due inside the same millisecond would collapse to the same deadline, and the scheduler would have no principled way to decide which of several devices due "now" actually goes first, or how much real emulated time separates a PIT tick from a VGA retrace that both happen to land in the same 1 ms window. Fractional-tick scheduling is what lets DOSBox-X place a DMA completion 60 cycles into a millisecond and a VGA retrace 1400 cycles in in a way that's stable and orderable, rather than arbitrary — which is what makes audio sound smooth instead of buzzy (sample-completion events land where they actually belong, not wherever the nearest millisecond boundary is), what makes PIT-driven timing behave like real 8253/8254 hardware rather than a coarse approximation of it, and what gives §4.9's tie-breaking rule above something meaningful to break ties *between*, instead of collapsing most of a millisecond's events into one indistinguishable instant. `CPU_CycleMax` is what makes that fractional precision practically achievable without floating-point division on the hot path — it's the reason a "fraction of a millisecond" can be represented as an ordinary integer cycle count.
+
+This is the key architectural distinction underneath everything @section(main-loop-and-event-scheduler/pic-runqueue, short) through @section(main-loop-and-event-scheduler/completing-a-millisecond, short) does: **device timing always lives in milliseconds, while CPU execution lives in cycles. `CPU_CycleMax` is the single conversion factor between them.** `PIC_RunQueue()` doesn't schedule anything or advance time — every call, it just re-runs this conversion against whatever `CPU_CycleMax` currently is, to find out how many cycles of CPU work fit before the queue's next millisecond-denominated deadline.
+
+## 4.10 Completing a Millisecond {#completing-a-millisecond}
+
+*Back on the spine now: this is the host branch of `Normal_Loop()`'s `while(1)` — the one that runs when §4.7's `PIC_RunQueue()` reports the budget exhausted, not the CPU branch.*
+
+Not everything a device needs to do belongs on that queue — and that's a separate mechanism from anything @section(main-loop-and-event-scheduler/pic-runqueue, short) or @section(main-loop-and-event-scheduler/event-scheduling, short) covered.
+
+When `PIC_RunQueue()` reports the budget exhausted, `Normal_Loop`'s host path calls `TIMER_AddTick()` (`src/hardware/pic.cpp` — the `TIMER_` prefix is a naming holdover from DOSBox's original split between "PIC" and "TIMER" concepts, never fully separated). This function:
+
+- Increments `PIC_Ticks`, the emulator's master millisecond counter
+- Refills the available cycle budget with one millisecond's worth of execution by adding `CPU_CycleMax` (plus any residual `CPU_Cycles`) to `CPU_CycleLeft`
+- Ages every entry in `pic_queue` by subtracting 1.0 from its `index`, since indices are expressed as "ticks from now" and one tick just elapsed
+- Walks the `firstticker` linked list and calls every registered `TIMER_TickHandler` — no `index`, no ordering, every one of them runs
+
+`CPU_CycleMax` is where the `cycles=` value from `dosbox-x.conf` actually enters the picture (@chapter(timing-and-cycle-management)) — but the number that determines how *often* this whole refill happens at all is older than the config file. Grep the tree for the constant behind "once per millisecond" and it resolves to this:
+
+```c
+// include/timer.h
+#define PIT_TICK_RATE_IBM 1193182
+```
+
+1,193,182 looks arbitrary until it's traced back. It's `14.31818 MHz ÷ 12` — and 14.31818 MHz is exactly 4× the NTSC color subcarrier frequency. IBM's original CGA card needed a crystal locked to that frequency to generate NTSC-compatible composite video; rather than pay for a second crystal to clock the CPU, the 8284A clock generator divided that same crystal down for CPU use too — by 3, for the 8088's 4.772727 MHz `CLK`, and by a further factor of 2 and 2 again for the PIT. One crystal, divided several ways.
+
+The last step in the chain is the least deliberate. IBM's BIOS programmed PIT channel 0 — the system timer — in a mode where a count of 0 is read as the maximum possible 16-bit count, 65536. That wasn't a chosen tick rate; it was the largest available divisor, minimizing how often the timer interrupt fired at all. `1,193,182 ÷ 65536 = 18.2065` — the number every BIOS, every DOS TSR that hooked IRQ0 directly, and this codebase's `TIMER_TickHandler` list have all inherited, not because 18.2 Hz was ever a target, but because nothing since 1981 has been able to change it without breaking software that assumed it.
+
+`TIMER_AddTick()` firing once per emulated millisecond, then, isn't an emulator design choice either — it's this chapter's execution loop reproducing, tick for tick, the same rate a real 8253 has been producing since the original PC.
+
+Once `TIMER_AddTick()` returns, `CPU_CycleLeft` holds a full millisecond's budget again — and the very next call to `PIC_RunQueue()` back in `Normal_Loop`'s `while(1)` has cycles to hand out. The loop is back in the CPU path.
+
+Seen together, `PIC_RunQueue()` and `TIMER_AddTick()` divide the scheduler into two complementary responsibilities. `TIMER_AddTick()` advances simulated time by exactly one millisecond and ages every pending event by that same amount. `PIC_RunQueue()` never advances time itself; instead, it repeatedly converts the queue head's millisecond deadline into a cycle budget using `CPU_CycleMax`, allowing the CPU to execute only until the next event becomes due. Raising `cycles=` therefore never makes timers fire earlier — it simply increases how much CPU work fits inside each simulated millisecond before the scheduler must stop and service the next event.
+
+## 4.11 Advancing Simulated Time {#advancing-simulated-time}
+
+*Still on the spine, still inside `Normal_Loop()`'s host branch — one level further in, at the `ticksRemain` check §4.10 just used but didn't yet explain.*
+
+One question is still open. @section(main-loop-and-event-scheduler/completing-a-millisecond, short) covered what `TIMER_AddTick()` *does* once it runs — but nothing so far has explained what decides *that* it should run, or when. `TIMER_AddTick()` isn't wired to an operating-system timer callback, and nothing in the PIC or PIT subsystems schedules it at a fixed interval the way `PIC_AddEvent()` schedules a device event. It only ever fires from one place, the same host branch of `Normal_Loop` that @section(main-loop-and-event-scheduler/normal-loop, short) already introduced:
+
+```cpp
+} else {
+    GFX_Events();
+    if (DOSBox_Paused() == false && ticksRemain > 0) {
+        TIMER_AddTick();
+        ticksRemain--;
+    } else {
+        increaseticks();
+        return 0;
+    }
+}
+```
+
+`ticksRemain > 0` is the actual gate, and `ticksRemain` is computed by `increaseticks()` (`src/dosbox.cpp`) from a genuine wall-clock measurement — `GetTicks()`, which wraps `SDL_GetTicks()`:
+
+```cpp
+uint32_t ticksNew = GetTicks();
+if (ticksNew <= ticksLast) {   // no real time has passed yet
+    wrap_delay(1);
+    return;
+}
+ticksRemain = ticksNew - ticksLast;   // how many real host ms actually elapsed
+...
+if (ticksRemain > 20) ticksRemain = 20;   // cap a catch-up burst
+```
+
+If no host time has elapsed since the last check, `increaseticks()` doesn't manufacture a tick — it calls `wrap_delay(1)`, hands the thread back to the host scheduler for roughly a millisecond, and returns without touching `ticksRemain` at all — the `while(1)` loop introduced by @section(main-loop-and-event-scheduler/normal-loop, short) simply asks again on the next pass. Only once `GetTicks()` actually shows forward progress does `ticksRemain` become positive, and `Normal_Loop`'s host branch calls `TIMER_AddTick()` once per outstanding host millisecond, decrementing `ticksRemain` each time, until the backlog is drained. If the host stalled long enough that several real milliseconds elapsed between checks — the process got descheduled, a window drag blocked the message loop — `ticksRemain` records that whole delay and the loop fires `TIMER_AddTick()` in a tight burst to catch up, capped at 20 so a long stall doesn't dump twenty milliseconds of device events on the emulated machine as a single indistinguishable instant.
+
+`TIMER_AddTick()`, in other words, is paced by real elapsed host time, not by an internal periodic callback of its own. Every call represents one simulated millisecond that has just become *due*, and `PIC_Ticks` only ever advances because `increaseticks()` decided a real millisecond had passed. This is also what fully answers @section(main-loop-and-event-scheduler/two-clocks-one-conversion, short): `increaseticks()` is what decides *when* a new simulated millisecond begins; `CPU_CycleMax` is what decides how much CPU work is allowed to happen inside it once it has.
+
+There's one deliberate exception, and it's worth naming here even though the underlying hardware history belongs later in this book (the closing note of @section(main-loop-and-event-scheduler/architectural-consequences, short) defers that history to @chapter(dma-and-pit)). DOSBox-X's own Turbo / fast-forward option, driven by `ticksLocked` and set from the `turbo` config key, skips the real-time check in `increaseticks()` entirely:
+
+```cpp
+if (GCC_UNLIKELY(ticksLocked)) { // For Fast Forward Mode
+    ticksRemain = 5;
+    ...
+    return;
+}
+```
+
+Rather than waiting for `GetTicks()` to show elapsed host time, Turbo mode hands `Normal_Loop` a fixed `ticksRemain = 5` on every single pass, regardless of whether any real time has actually gone by. `TIMER_AddTick()` still does exactly the same thing it always does — one call, one simulated millisecond, one `CPU_CycleMax`-sized refill — but now it's called as fast as the host can keep up, with nothing pacing it against the wall clock at all. Turbo mode doesn't redefine what a simulated millisecond is or change `CPU_CycleMax`; it just removes the gate that normally decides when the next one is allowed to begin.
+
+## 4.12 Exceptional Control Flow {#exceptional-control-flow}
+
+*This one's a genuine detour from the spine — it closes out two loose threads (§4.5's open assumption about rebooting, and §4.6's positive-return case) rather than following execution one level deeper. §4.13 picks the spine back up and lays out the whole path this chapter has traced.*
+
+@section(main-loop-and-event-scheduler/installing-the-execution-loop, short) left an assumption open: if `LoopHandler` exists and can be swapped, rebooting the virtual machine ought to install a different one for the new state. Grep the tree for every caller of `DOSBOX_SetLoop()` and the answer is already in hand from @section(main-loop-and-event-scheduler/installing-the-execution-loop, short) — there are two, `Normal_Loop` and `DEBUG_Loop`, and neither has anything to do with rebooting. It never does.
+
+Reboot, shutdown, booting a guest OS, and booting into a BIOS image are handled by something that leaves no trace in `DOSBOX_SetLoop()` at all: unwinding the C++ stack with an integer exception, resetting machine state, and re-entering the same `Normal_Loop()`.
+
+That leaves one more loose thread from @section(main-loop-and-event-scheduler/normal-loop, short): a callback returning a positive value from inside the CPU path. It's tempting to read a non-zero callback return as "something demands the whole emulator stop." It doesn't. `CALLBACK_RunRealFar`, `CALLBACK_RunRealFarInt`, `CALLBACK_Idle`, and similar helpers in `src/cpu/callback.cpp` need to run a piece of real-mode guest code to completion and then regain control, and they do it by calling `DOSBOX_RunMachine()` recursively:
+
+```cpp
+// src/cpu/callback.cpp — one of several call sites
+DOSBOX_RunMachine();
+```
+
+Before that call, the helper pushes a fake return address pointing at a `stop_handler` callback. When the guest code it invoked eventually returns, execution lands on that address, `stop_handler` fires, and returns:
+
+```cpp
+// include/callback.h
+#define CBRET_NONE 0
+#define CBRET_STOP 1
+```
+
+`Normal_Loop` propagates `CBRET_STOP` straight out, which stops the *nested* `do/while` inside that recursive `DOSBOX_RunMachine()` call — control returns to whichever `callback.cpp` helper started it, not to the outermost frontend. `DOSBOX_RunMachine` is declared `void`; the value never travels further than the `do/while` immediately around it. A non-zero callback return means "this nested call is done," not "stop the emulator."
+
+Actual shutdown and reboot are a different mechanism, and they bypass `loop` entirely. `Normal_Loop`'s body is wrapped in `try`, and its `catch (int x)` absorbs exactly one case:
+
+```cpp
+// src/dosbox.cpp, inside Normal_Loop's try/catch
+catch (int x) {
+    dosbox_allow_nonrecursive_page_fault = saved_allow;
+    if (x == 4 /* CMOS shutdown */) {
+        ret = 0;
+    } else {
+        throw;   // everything else propagates upward, unhandled here
+    }
+}
+```
+
+Every other value is rethrown and unwinds through `DOSBOX_RunMachine`'s `do/while` — which has no `try`/`catch` of its own — up to the outermost call site in `main()` (`src/gui/sdlmain.cpp`):
+
+```cpp
+// src/gui/sdlmain.cpp, around the top-level DOSBOX_RunMachine() call
+try {
+    DOSBOX_RunMachine();
+} catch (int x) {
+    if (x == 2) {
+        // booting a guest OS; image already loaded, CPU registers already set up
+        run_machine = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else if (x == 3) {
+        // reboot the whole system
+        reboot_machine = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else if (x == 5) {
+        E_Exit("Obsolete int signal");   // legacy PC-98-mode signal, no longer used
+    } else if (x == 6) {
+        // reboot the DOS kernel only
+        reboot_dos = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else if (x == 7) {
+        // DOS kernel corruption; restart the kernel and wait on the debugger
+        reboot_dos = true;
+        wait_debugger = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else if (x == 8) {
+        // boot into a BIOS image, shutting down the DOSBox-X BIOS
+        run_bios = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else if (x == 9) {
+        // BIOS caught a JMP to F000:FFF0 with no other reset signal
+        reboot_machine = true;
+        dos_kernel_shutdown = !dos_kernel_disabled;
+    } else {
+        // kill switch — see throw(0) / throw(1) call sites elsewhere in the tree
+        run_machine = false;
+        dos_kernel_shutdown = false;
+    }
+}
+```
+
+The `throw` sites are wherever emulated hardware or host-event code needs to force a transition: `CheckQuit()` in `sdlmain.cpp` (`throw(0)` on window-close/quit-confirmed), BIOS POST/reboot handling in `src/ints/bios.cpp` (`throw 1` for shutdown-and-exit), and similar sites elsewhere. None of them touch `loop`. A reboot is: unwind the stack to `main()`'s `try`, set the appropriate state flags, call `DOSBOX_RunMachine()` again — reusing the same `Normal_Loop` throughout. The source itself flags the mechanism with a comment near one of the throw sites calling it "a stupid and nondescriptive way to signal shutdown/reset."
+
+## 4.13 The Scheduler as a Contract {#the-scheduler-as-a-contract}
+
+Everything from §4.6 through §4.12 has been procedural — this function does this, that field means that. It's worth stepping back, now that all the pieces are on the table, and stating the single rule that all of it exists to enforce:
+
+> **No hardware event may occur after the CPU has already executed past it.**
+
+That's the whole contract. It sounds almost too simple to be load-bearing, but nearly everything this chapter has traced falls directly out of it:
+
+- **Why cycle budgeting exists at all** (§4.7): the CPU can't be handed an open-ended "run until told to stop," because there's no way to guarantee it would stop exactly at the next event's deadline rather than overshooting it. A bounded batch, sized precisely to the next deadline, is the only way to guarantee the contract mechanically rather than by hoping the CPU checks in often enough.
+- **Why the queue stays sorted by `index`** (§4.8): the contract is about the *next* event specifically — the soonest deadline — so the only entry that ever matters for sizing a batch is the head of the queue. An unsorted queue would mean scanning every entry, every batch, to find out which one the contract currently applies to.
+- **Why `AddEntry` can retroactively shrink an in-flight batch** (§4.8): a batch computed against the queue as it stood a moment ago can be invalidated by a newly enqueued event that's now sooner. The contract doesn't say "honor the deadline you knew about when the batch started" — it says no event ever gets executed past, full stop, so a newer, closer deadline has to win even mid-batch.
+- **Why execution happens in bounded slices instead of one continuous run** (§4.1, §4.7): a slice is bounded by exactly one thing — the next deadline the contract is currently protecting. Once that deadline is reached, the contract requires stopping, unconditionally, before doing anything else.
+- **Why the CPU can't simply run as fast as the host allows** (@chapter(time-in-dosbox-x, short), §4.9): "as fast as possible" and "exactly up to the next scheduled deadline, no further" are different instructions, and only the second one satisfies the contract.
+
+Read this way, the scheduler isn't a grab-bag of cooperating functions that happen to keep hardware timing plausible. It's a single invariant, enforced continuously, and `PIC_RunQueue()`, `PIC_AddEvent()`, `TIMER_AddTick()`, and `increaseticks()` are four different mechanisms for upholding the same one sentence from four different angles — sizing the next batch, inserting new deadlines without breaking the ordering the contract depends on, advancing the clock the deadlines are measured against, and pacing all of it to the one real clock available. Every implementation detail in this chapter is in service of that single guarantee.
+
+## 4.14 Architectural Consequences {#architectural-consequences}
+
+Laid end to end, the path this chapter has followed is:
+
+```
+main()
+  → DOSBOX_RunMachine()
+    → Normal_Loop()
+      → PIC_RunQueue()
+        → CPU_Cycles computed
+          → cpudecoder()
+            → CPU stops (budget exhausted, or a callback fires)
+              → next event fires, or the millisecond completes
+                → back to PIC_RunQueue()
+```
+
+The CPU never advances the machine independently. Every burst of execution is bounded by the scheduler before it starts, which is why the scheduler — not the CPU core covered starting in @chapter(interpreter-core, short) — is the component that determines when the virtual machine changes state. Ordering follows directly from @section(main-loop-and-event-scheduler/pic-runqueue, short) and @section(main-loop-and-event-scheduler/event-scheduling, short): VGA retrace, DMA completion, sound IRQs, and serial byte arrival are all `PICEntry` instances in the same array, sorted by `index`, so which fires first depends only on that ordering — not on host thread scheduling. Accuracy is bounded the same way execution is: events are scheduled in cycle-equivalent units within a millisecond, so a very low `CPU_CycleMax` coarsens how precisely two nearby events can be told apart.
+
+It's worth making explicit what every single pass through that path guarantees, since the chapter has largely left the reader to infer these along the way:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    MAIN LOOP INVARIANTS                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. Every expired event is dispatched before any further CPU cycles    │
+│     execute in that millisecond. (§4.7, step 2, runs before step 3.)   │
+│                                                                          │
+│  2. The CPU never executes past the next scheduled event's deadline —  │
+│     §4.13's contract, mechanically enforced by the batch size §4.7     │
+│     computes and by §4.8's retroactive batch-shrink on enqueue.        │
+│                                                                          │
+│  3. Hardware event ordering is deterministic: same guest input         │
+│     produces the same dispatch order, every run, because it depends    │
+│     only on `index` and insertion order (§4.8) — never on host thread  │
+│     scheduling or timing jitter.                                       │
+│                                                                          │
+│  4. Guest time never skips a scheduled event: `TIMER_AddTick()` (§4.10)│
+│     advances `PIC_Ticks` by exactly one millisecond at a time, and     │
+│     `PIC_RunQueue()` is re-consulted every single time the budget      │
+│     changes — there's no path from "time has advanced" to "the next   │
+│     iteration" that doesn't pass back through the queue.               │
+│                                                                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Ownership follows the same shape as everything else in this chapter, and it's worth stating plainly rather than leaving it to be inferred from which file each function happened to live in:
+
+```
+   PIC (src/hardware/pic.cpp)          CPU (interpreter / dynamic core)
+   owns: event timing, ordering,        owns: instruction execution,
+   and the cycle-budget conversion      guest register/memory state
+
+                    \                  /
+                     \                /
+                      Normal_Loop()
+                   owns: coordinating both —
+                   asking the PIC how much
+                   the CPU is allowed to do,
+                   never doing either job itself
+```
+
+The PIC subsystem decides *when* and *how much*; the CPU decides *what*, within whatever it's been allowed; `Normal_Loop()` is pure coordination and owns neither — it just keeps asking `PIC_RunQueue()` the same yes/no question, forever, and honoring whichever answer comes back.
+
+## 4.15 Busy Waits, and Why DOSBox-X Doesn't Melt Your Laptop {#busy-waits-and-why-dosbox-x-doesnt-melt-your-laptop}
+
+One more question this structure answers: why doesn't a DOS busy-wait pin the host CPU at 100%? A huge amount of DOS-era code polls hardware with no yield instruction at all:
+
+```asm
+wait_retrace:
+    mov dx, 3DAh
+    in  al, dx
+    test al, 08h
+    jz  wait_retrace
+```
+
+On real hardware that costs nothing — a single-tasking OS with nothing else to run. Under emulation, the guest CPU reports 100% utilization by its own accounting, but that loop is still just guest code running inside `(*cpudecoder)()`, and @section(main-loop-and-event-scheduler/pic-runqueue, short) already established that it's only ever handed a bounded number of cycles before control returns to the scheduler. Once a full millisecond is accounted for, `increaseticks()` (`src/dosbox.cpp`) — the same real-time gate @section(main-loop-and-event-scheduler/advancing-simulated-time, short) traced — checks whether any new host time has actually elapsed, and this time it's worth looking at the branch @section(main-loop-and-event-scheduler/advancing-simulated-time, short) skipped past:
+
+```cpp
+if (ticksNew <= ticksLast) {
+    ticksAdded = 0;
+    if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust || sleep1count < 3) {
+        wrap_delay(1);
+    } else {
+        // small randomized sleep pattern to avoid resonance with
+        // platforms whose sleep granularity always rounds to 1 ms
+        ...
+    }
+    ...
+    return;
+}
+```
+
+`wrap_delay(1)` wraps `SDL_Delay()`, handing the thread back to the host scheduler for roughly a millisecond. The guest never notices — it's still spinning as fast as it likes, inside a budget it doesn't control. The host, watching from outside, sees a process that sleeps most of the time and wakes briefly, once per emulated millisecond, to do a bounded amount of work. Set `cycles=` very high with auto-adjust disabled and more of that millisecond shifts into the CPU path before `increaseticks()` is ever reached — which is why unrestricted "max" cycles mode draws noticeably more host power than a fixed, period-appropriate cycle count.
+
+<Diagram src="03-5-host-sleep-guest-busywait.svg" />
+
+## 4.16 Closing {#closing}
+
+**Try it yourself:** build a debug build and add a `LOG_MSG` inside `PIC_AddEvent` printing `handler` (as a function pointer — `addr2line` or your build's map file resolves it) alongside `delay`. Boot a DOS game and watch what actually populates the queue during a single VGA frame: PIT rearm events, VGA retrace events, and — if the game uses the Sound Blaster — a stream of DMA-completion events, all landing in the same structure traced in this chapter.
+
+The 18.2 Hz derivation belongs with the PIT hardware itself, not here: @section(main-loop-and-event-scheduler/completing-a-millisecond, short) explains where the tick rate comes from mechanically, but the historical reasoning behind IBM's divisor choice is deferred to @chapter(dma-and-pit). Likewise, @section(main-loop-and-event-scheduler/advancing-simulated-time, short) covers DOSBox-X's own Turbo/fast-forward option — the `ticksLocked` bypass — but not the thing it's named after: the real, physical Turbo button, a case-front switch on real PC clones that solved a related but historically distinct problem, and which also belongs with the 8253/8254 PIT hardware in @chapter(dma-and-pit).
+
+This chapter is where the two before it converge. @chapter(what-is-dosbox-x) and @chapter(dosbox-x-architecture) described the emulator's structure — what pieces exist, and how they're allowed to talk to each other. @chapter(time-in-dosbox-x) introduced its three notions of time — host wall-clock time, guest simulated time, and CPU execution budget — and how the last two are kept honest against the first. Neither chapter, on its own, explained how those pieces actually cooperate during a single moment of execution. This one did: the scheduler determines when hardware must run, by enforcing the one contract §4.13 named; the CPU receives a bounded execution budget sized against that contract, never an open-ended license to run; and control repeatedly alternates between guest execution and event dispatch, one bounded slice at a time, for as long as the emulator runs. With that execution model in hand, the remaining chapters can examine individual subsystems — the CPU cores, the PIC and PIT themselves, VGA, sound, DMA — each one now placeable within the same scheduling framework traced here, rather than as an isolated block of behavior with no stated relationship to when it actually runs.
+
+*Next: @chapter(memory-model-and-address-translation) — Memory Model and Address Translation, where we follow a `far`/`_based` pointer from a segment register down through DOSBox-X's page handler tables.*

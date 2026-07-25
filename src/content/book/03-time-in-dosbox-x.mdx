@@ -1,0 +1,1207 @@
+---
+title: "Time in DOSBox-X"
+description: "Three clocks, three units: host wall-clock milliseconds, simulated PIC_Ticks, and raw CPU cycles. Traces GetTicks(), PIC_Ticks, and CPU_CycleMax/CPU_Cycles/CPU_CycleLeft through the source to show how DOSBox-X converts between them continuously, and reconciles simulated time against the real clock via increaseticks()."
+order: 3
+chapterSlug: "time-in-dosbox-x"
+part: "foundations"
+---
+
+# Chapter 3 — Time in DOSBox-X
+
+*(Source references below are against `joncampbell123/dosbox-x`, commit `192c1756`, cloned 2026-07-25. File/line numbers will drift as the project moves; treat them as coordinates into a moving target, not fixed citations.)*
+
+---
+import Diagram from '../../components/Diagram.astro';
+
+## 3.1 What Is Time?
+
+@chapter(dosbox-x-architecture) closed with a promise: before meeting the scheduler that decides which module runs next, this book needs to establish what "when" actually means for an emulator. That promise is this chapter's whole job, and it starts further back than DOSBox-X's source tree. Before anything about DOSBox-X, before PIT counters or `SDL_GetTicks()`, it's worth asking a more basic question: what does a computer actually know about time?
+
+The honest answer is: nothing.
+
+> A processor only knows how to execute operations. It has no innate sense of "a second," "a millisecond," or "now." The concept of time appears only because hardware repeatedly generates electrical pulses from an oscillator, and someone, somewhere, decided to count them.
+
+A crystal oscillator — typically a small sliver of quartz — vibrates at a very stable, very specific rate when a voltage is applied to it. That vibration is converted into a square-wave electrical signal: the **clock signal**. Every rising edge of that signal is one **cycle**. The number of cycles per second is the oscillator's **frequency**, measured in Hertz.
+
+An original IBM PC's 8088 CPU ran from a 14.31818 MHz crystal, divided by 3, giving a CPU clock of roughly 4.77 MHz. That number means the CPU's internal logic advances by one step about 4,772,727 times per second. Nothing in the silicon "knows" that this corresponds to a seventh of a second, or a working day, or a human lifetime. All it knows is: pulse, pulse, pulse.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                     WHERE "TIME" COMES FROM                            │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Quartz crystal                                                       │
+│        │  vibrates at a fixed physical rate                            │
+│        ▼                                                                │
+│   Oscillator circuit                                                    │
+│        │  converts vibration into a square wave                        │
+│        ▼                                                                │
+│   Clock signal  ⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍⎍  (~4.77 MHz on an 8088 PC)         │
+│        │  each rising edge = one cycle                                  │
+│        ▼                                                                │
+│   CPU logic advances one step per cycle                                │
+│        │                                                                │
+│        ▼                                                                │
+│   Instructions take a fixed number of cycles to execute                │
+│                                                                          │
+│   "One second" is not a hardware concept. It is a human label          │
+│   applied after the fact to roughly 4.77 million of these pulses.      │
+│                                                                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+An instruction doesn't take "a few nanoseconds." It takes a certain number of cycles — determined by what the instruction does, which operands it touches, and the quirks of the specific CPU executing it. Converting cycles into seconds is a matter of dividing by the oscillator's frequency, but the hardware itself never performs that division. It just keeps pulsing, and keeps executing.
+
+**Key insight:** hardware measures work in cycles, not seconds. Everything else — milliseconds, frame rates, interrupt frequencies, the feeling of a game running "too fast" or "too slow" — is built on top of that one fact.
+
+---
+
+## 3.2 How a Real IBM PC Experiences Time
+
+If time is just a count of cycles, the next question is: whose cycles?
+
+A real IBM PC does not have one clock. It has several, and they are electrically independent of one another:
+
+- The **CPU clock** — the 4.77 MHz (or, on later machines, faster) oscillator driving instruction execution.
+- The **PIT clock** — the Programmable Interval Timer (Intel 8253/8254) runs from its own 1.193182 MHz input, derived from the same 14.31818 MHz crystal by a different divider than the one feeding the CPU. Each of its three counters decrements on every tick of *this* clock, completely independent of what the CPU happens to be executing.
+- The **RTC** — the Real-Time Clock chip keeps wall-clock date and time (year, month, day, hour, minute, second) running from its own low-power crystal, usually 32.768 kHz, so it keeps ticking even when the machine is off.
+- **Video refresh** — the display controller scans out the picture at a rate tied to yet another clock (roughly 60 Hz for CGA/EGA/VGA-era NTSC-derived timing), governing horizontal and vertical retrace.
+- **DMA timing** — the DMA controller moves bytes in step with its own bus-cycle timing, again not directly tied to CPU instruction boundaries.
+
+None of these clocks ask each other what time it is. Each one simply free-runs from its own oscillator, and produces an interrupt or a signal edge whenever it completes its own count. The PIT's most famous job is a good example: it divides its 1.193182 MHz input down (traditionally by 65536, the largest 16-bit divisor) to fire IRQ 0 at roughly 18.2 times a second — the classic PC "system timer tick." That number falls out of PIT hardware entirely; the CPU has no say in it, and no way to query it faster than the interrupt actually arrives.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│              INDEPENDENT CLOCKS ON A REAL IBM PC                       │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   CPU crystal  ──────► CPU clock  ────► instructions execute           │
+│                                                                          │
+│   14.31818 MHz ──────► PIT clock  ────► counters decrement, IRQ 0      │
+│         crystal        (1.193182 MHz)    fires at ~18.2 Hz             │
+│                                                                          │
+│   32.768 kHz   ──────► RTC clock  ────► wall-clock date/time           │
+│         crystal                                                        │
+│                                                                          │
+│   video clock  ──────► scanline/frame timing ────► retrace interrupts  │
+│                                                                          │
+│   No single "master clock" ties these together. Each one free-runs.    │
+│                                                                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The important consequence is this:
+
+> The CPU never asks "what time is it?" Devices simply advance because their clocks keep ticking, on their own schedules, whether or not the CPU is paying attention.
+
+Software that wants to know the time has to go and *ask* a specific device — read the PIT's current count, read the RTC registers, wait for a vertical-blank signal from the video hardware. There is no unified "now" anywhere on the machine. There are only several independent counters, each faithfully tracking its own oscillator, and a CPU that periodically checks in on whichever one it currently cares about.
+
+*(The 18.2 Hz figure and the reasoning behind IBM's choice of divisor are covered in more historical depth in §3.11, once the millisecond as a unit has been properly introduced.)*
+
+---
+
+## 3.3 Why Emulation Breaks This Model
+
+That whole arrangement — several independent, free-running oscillators, each quietly ticking away in its own silicon — is exactly what stops existing the moment you emulate the machine instead of building it.
+
+DOSBox-X is a program. It runs as an ordinary process on a host operating system (Windows, Linux, macOS). It has no crystal oscillator of its own. It has no PIT chip, no RTC chip, no video scan converter generating retrace pulses. All of that hardware is gone, replaced by software that has to *behave as if* it were still there.
+
+So: if the guest hardware no longer exists, where do these clocks come from?
+
+The host only hands DOSBox-X three things to work with:
+
+- the current **wall-clock time**, readable on demand,
+- **CPU scheduling** — the host OS decides when DOSBox-X's process actually gets to run, in slices of arbitrary and unpredictable length,
+- and `sleep()` — the ability to voluntarily give up the CPU for a requested duration (with no guarantee the host honors that duration precisely).
+
+That's it. There is no PIT interrupt arriving every 1/18.2 of a second on its own initiative. There is no video controller independently scanning out frames. There is no RTC quietly keeping wall time in the background, indifferent to whether the emulator process is even running.
+
+**Everything else must be synthesized.** Every one of those independent clocks from §3.2 — the PIT's countdown, the guest's perceived instruction throughput, the video refresh rate the guest's demo-scene code busy-waits on — has to be reconstructed by DOSBox-X itself, in software, from nothing more than "what time does the host say it is" and "how much CPU time has the host actually given me."
+
+This is the real subject of this chapter: not what DOSBox-X's timing variables are named, but what problem forces them to exist at all. A real PC never had to solve this problem — its clocks were physical and simply ran. An emulator has exactly one physical clock available (the host's), and has to fake all the others.
+
+There's a genuinely strange consequence buried in that last sentence, worth naming early even though the mechanics won't arrive until §3.8: a real PC's oscillator *causes* time to pass, which in turn lets a certain number of instructions execute. DOSBox-X has to run that relationship backwards. It has no oscillator to start from, so it starts instead from a configured *budget* of guest work, executes that budget, and only afterward treats the amount of work completed as evidence of how much guest time has passed. Cause and effect are swapped: on real hardware, time produces execution; in DOSBox-X, execution produces time. Keep that inversion in the back of your mind through the sections that build up to it.
+
+The existence of a single host clock does not mean an emulator can just hand that clock to the guest. The original PC never ran on wall-clock time; it ran on oscillators, counters, bus cycles, and device interactions — the picture §3.1–§3.2 already built. DOSBox-X has none of that hardware, so it has to construct a different notion of time: one derived from the host clock, but not identical to it. **The remainder of this chapter explains how.**
+
+### The Pipeline This Chapter Builds
+
+Stripped of variable names, the software DOSBox-X substitutes for a real PC's electronics is a single pipeline. Every remaining section in this chapter exists to build, or explain, one box in it:
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                    THE PIPELINE, WITHOUT VARIABLE NAMES                │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Host milliseconds                                                    │
+│   (the one real clock DOSBox-X has — §3.6)                             │
+│          │                                                              │
+│          ▼                                                              │
+│   Cycle budget                                                          │
+│   (how much guest work is allowed this millisecond — §3.7)             │
+│          │                                                              │
+│          ▼                                                              │
+│   CPU execution                                                        │
+│   (the budget actually spent, instruction by instruction — §3.7)       │
+│          │                                                              │
+│          ▼                                                              │
+│   Guest milliseconds                                                    │
+│   (completed simulated time, whole + fractional — §3.7–§3.8)           │
+│          │                                                              │
+│          ▼                                                              │
+│   Virtual hardware                                                      │
+│   (PIT, VGA, sound, DMA — every device reads its "now" off this line)  │
+│                                                                          │
+│   The arrow from "Host milliseconds" down to "Cycle budget" is not     │
+│   free — it has to be checked and corrected continuously, or the two   │
+│   ends drift apart. That correction is §3.9, and it is the arrow       │
+│   the rest of the chapter has been building toward.                    │
+│                                                                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Keep this shape in mind through the rest of the chapter. §3.5 explains why the first arrow — host milliseconds flowing directly into guest milliseconds — can't just be a straight line. §3.6 through §3.8 build the boxes in between. §3.9 is the arrow itself: the mechanism that keeps the top of the pipeline and the bottom of it from drifting apart.
+
+---
+
+## 3.4 Three Notions of Time
+
+The preceding section established the constraint this whole chapter works inside: DOSBox-X has exactly one source of real time — the host machine's clock — but has to reproduce the passage of time inside an entirely different machine. The guest can't simply read the host clock and treat it as its own state. CPU execution, programmable timers, interrupts, DMA, and every other device all have to advance according to the guest's *own* notion of time, not the host's.
+
+This leads to an important observation: DOSBox-X does not maintain a single universal clock. Instead, its timing model is built from three distinct domains, each answering a different question — how much real time has passed, how many guest milliseconds have completed, and how far execution has progressed through the current one:
+
+<Diagram src="03-1-time-domains-dosbox-x.svg" />
+
+```text
+┌────────────────────────────────────────────────────────────────────────────┐
+│             RECONSTRUCTING GUEST "NOW" FROM THE THREE DOMAINS              │
+├────────────────────────────────────────────────────────────────────────────┤
+│ 1) HOST wall-clock — real elapsed time on the host                         │
+│    GetTicks() -> SDL_GetTicks()  (include/timer.h:33)                      │
+│    ticksLast  (host ms, ~1 ms resolution; §3.9 samples this)               │
+│                                                                            │
+│ 2) SIMULATED guest time — completed milliseconds                           │
+│    PIC_Ticks++ in TIMER_AddTick()  (src/hardware/pic.cpp:854)              │
+│    PIC_Ticks  (guest ms)                                                   │
+│                                                                            │
+│ 3) CPU execution state — cycles within the current ms                      │
+│    CPU_Cycles + CPU_CycleLeft + CPU_CycleMax  (src/cpu/cpu.cpp:205-207)    │
+│    (guest cycles; CPU_CycleMax ~3000 by default)                           │
+│                                                                            │
+│    The ms fraction, from (3):                                              │
+│    PIC_TickIndex() = (CPU_CycleMax - CPU_CycleLeft - CPU_Cycles)           │
+│                     / CPU_CycleMax      <- float  (include/pic.h:60)       │
+│                     │                                                      │
+│                     ▼                                                      │
+│    PIC_FullIndex() = PIC_Ticks + PIC_TickIndex()  (include/pic.h:72)       │
+│    = guest "now" (ms, sub-millisecond precision)                           │
+│                                                                            │
+│    No variable stores "now"; it is derived on demand from (1)/(2)/(3),     │
+│    which is why §3.9 must keep the three domains in sync.                  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The first domain is the **host wall-clock**, obtained through `GetTicks()`, which ultimately calls `SDL_GetTicks()`. It's the only source of actual elapsed time available to the emulator — but on its own it says nothing about how far the emulated PC should have progressed.
+
+The second domain is the **simulated guest clock**.[^simulated-vs-emulated] `PIC_Ticks` advances as the emulated system completes milliseconds of guest time. This is fundamentally different from the host clock: it represents time *inside* the virtual IBM PC. The two may coincide when the emulator is running at its intended rate, but there's no inherent reason for them to move in lockstep — nothing forces it.
+
+[^simulated-vs-emulated]: This book uses *emulated* for the general act of reproducing PC hardware in software — emulated CPU, emulated VGA, emulated hardware generally — and reserves *simulated* specifically for guest time. The distinction is deliberate: an emulated device reproduces a real chip's behavior, but there's no physical clock chip behind guest time for DOSBox-X to reproduce the behavior *of* — §3.3 established that DOSBox-X has no oscillator of its own. Guest time isn't emulated from something that exists; it's simulated — computed from nothing but cycles spent — which is the whole reason this chapter exists. The same word is used consistently for this quantity throughout Chapters 3 and 4.
+
+The third domain is **CPU execution state**, represented by `CPU_CycleMax`, `CPU_CycleLeft`, and `CPU_Cycles`. This is where an important distinction has to be made: these counters are not a third clock in the same sense as the other two. They describe how much guest work is still allowed within the current millisecond — an allowance, drawn down as instructions execute — not a measurement of elapsed time in their own right. DOSBox-X uses that allowance to work out the fractional position within the current millisecond, but the counters themselves never advance independently the way a clock does. In one line: **CPU cycles are execution budget, not a clock.**
+
+That distinction is why DOSBox-X doesn't store the guest's current timestamp in a single variable. Completed milliseconds live in `PIC_Ticks`; the fractional position within the current one is derived from the CPU execution state, via `PIC_TickIndex()` — and the two are combined, on demand, by `PIC_FullIndex()`. No variable stores that result directly. It's reconstructed whenever a component needs it, from whichever of the three domains are relevant, rather than kept continuously up to date.
+
+But this immediately exposes the next problem. The guest clock can't be allowed to drift arbitrarily relative to the host clock. If the CPU executes too much work, simulated time runs ahead of real time; if too little, it falls behind. DOSBox-X therefore needs a mechanism that continually reconciles these two independently-advancing notions of elapsed time — and that reconciliation isn't a minor implementation detail bolted on afterward. It's what turns three separately-maintained domains into a functioning real-time emulator: it decides when the emulator must wait for the host, when it may allow more CPU work, and how the execution budget gets adjusted when the guest falls behind.
+
+The next section starts with the question that has to be settled first, before that reconciliation mechanism can even be described: why the guest clock can't simply mirror the host clock in the first place.
+
+---
+
+## 3.5 Why Guest Time Cannot Follow Wall Clock
+
+*(This section is about the top arrow in the pipeline from §3.3 — the one from "Host milliseconds" straight down to "Guest milliseconds." It explains why that arrow can't be drawn as a straight line.)*
+
+> If Windows (or Linux, or macOS) pauses the DOSBox-X process for 50 ms to let some other program run, did the emulated CPU execute any instructions during that pause?
+>
+> No. It was simply not running.
+>
+> If the host CPU suddenly became ten times faster, would more guest time have passed in that same real millisecond?
+>
+> Also no — unless DOSBox-X were made to notice and account for it.
+
+Those two answers already rule out the obvious design: guest time cannot simply mirror the host's wall clock. Something else has to drive it.
+
+Before examining the variables themselves, it's worth understanding the fundamental design choice that shapes everything that follows: **guest simulated time advances based on CPU cycles executed, not on elapsed host wall-clock time.**
+
+This is not an arbitrary implementation detail—it is the only way to guarantee correct, deterministic emulation. Here's why:
+
+### Guest Time Is a Function of Work Done, Not Host Time
+
+In a real IBM PC, time isn't handed down from an external atomic clock to the CPU. Time is generated by the CPU itself via its crystal oscillator. Each instruction consumes a certain number of cycles—varying by instruction type, operand location, and microarchitecture—and the CPU advances its internal state by that many cycles.
+
+The PIT (Programmable Interval Timer) operates on a separate clock derived from the same crystal (1.193182 MHz, or 14.31818 MHz ÷ 12). Each of its three counters decrements on every tick of this independent clock, completely independent of CPU instruction execution. When a counter reaches zero, it fires an interrupt—most famously IRQ 0 at approximately 18.2 Hz for the system timer.
+
+DOSBox-X does not model the PIT as a second, independently-ticking clock. There is one synthetic time coordinate: `PIC_Ticks` (completed simulated milliseconds) plus a fraction derived from CPU cycle accounting, `PIC_TickIndex() = (CPU_CycleMax − CPU_CycleLeft − CPU_Cycles) / CPU_CycleMax` (`pic.h:60-61`). A PIT counter's value is never decremented tick-by-tick against its own clock; it's computed on demand as a function of that one coordinate, `counter = cntr_cur − index × (PIT_TICK_RATE / 1000)` (`timer.cpp:365`), using the real 1.193182 MHz ratio to keep the frequency correct. IRQ 0 itself is scheduled the same way every other device interrupt is—`PIT0_Event` re-arms itself through `PIC_AddEvent()` (`timer.cpp:444`), the same cycle-driven event queue covered in @chapter(main-loop-and-event-scheduler). The guest's notion of time reduces to one clock, built from CPU cycle accounting, not two mechanisms running in parallel.
+
+If DOSBox-X advanced guest time by wall-clock time—saying "1 real millisecond passed, so the guest must have experienced 1 millisecond"—the relationship between instructions executed and time perceived would break:
+
+- On a heavily loaded host, the emulator might only execute 500 instructions in a real millisecond.
+- On a fast, idle host, it might execute 5,000 instructions in the same real millisecond.
+
+If guest time simply followed the wall clock regardless of instructions executed, the guest would "jump" forward in time without having done the work it expected. Consider a busy-wait loop:
+
+```assembly
+mov ax, [timer_value]
+cmp ax, target_value
+jne loop
+```
+
+The number of iterations this loop executes per millisecond directly affects how the guest perceives time. Advancing time without executing the corresponding instructions would cause the loop to terminate at the wrong moment—a classic emulation bug that breaks timing loops in games and demos.
+
+**Engineering observation:** Within a simulated millisecond, DOSBox-X's time model is instruction-driven: the emulator does not sample a host clock to decide how far the guest has progressed. It advances `PIC_TickIndex()` by consuming `CPU_Cycles`, and a millisecond only completes once that budget is spent. This is what keeps a busy-wait loop's iteration count tied to actual instructions executed rather than to unpredictable host scheduling.
+
+One qualification: this describes how a *single* millisecond is accounted for, not how big that millisecond's cycle budget is. With a fixed cycle count (`cycles=NNNN`), `CPU_CycleMax` never changes, and guest time is a deterministic function of instructions executed—host speed only affects how much real time a session takes to run, not the guest's timing. In the default `cycles=auto` mode, `CPU_CycleMax` is periodically retuned by the `increaseticks()` function (`dosbox.cpp:566–720`, with the auto-adjust feedback law at `dosbox.cpp:636–711`) based on recent host throughput, specifically to keep the guest tracking roughly real-time speed. So host load does feed back into the model in auto mode—just at the level of resizing the next window's budget, not by adjusting time mid-instruction or mid-millisecond.
+
+**Historical context:** `cycles=` is not an attempt at hardware-accurate timing, and DOSBox-X's own documentation says so directly: "Does DOSBox-X emulate the CPU cycles accurately? A: No... DOSBox and by extension DOSBox-X instead completes one instruction per emulated-cycle... For many legacy systems, cycle accurate emulation is desirable. But this does not apply to emulating PCs." The reason is architectural, not a shortcut taken for performance: real IBM PC clones never shared a single consistent instruction-timing table the way arcade boards or a fixed console architecture did. A 286 from one vendor and a 286 from another could take a different number of real clock cycles to execute the same instruction, and software of the era had no way to rely on either figure being consistent — so treating "one instruction" as "one abstract cycle" isn't a simplification of some more precise underlying model DOSBox-X is approximating. It's the only model that actually matches what PC software could ever assume about its own timing in the first place.
+(Source: DOSBox-X wiki, CPU settings)
+
+### The "Stop at the Event" Problem
+
+Devices in the guest schedule events at specific fractional-millisecond intervals based on *cycle counts*. A sound card may need to write a sample exactly 0.7 ms from now. The VGA controller may need to fire a retrace interrupt at a precise point within the scanline.
+
+If time advanced by wall-clock interrupts, the host OS might not wake the emulator process until 2 ms of real time has passed. By the time the emulator checks the wall clock, the event is already late—the precise moment has been missed.
+
+By advancing time via cycles, the emulator executes instructions in batches and checks the fractional guest time (`PIC_FullIndex()`) after every batch. If the next event is due in 1,200 cycles, the scheduler can hand exactly 1,200 cycles to the CPU decoder. The CPU stops *exactly* at 0.7 ms of guest time, fires the event, and continues. Wall-clock time is far too coarse and unpredictable for sub-millisecond device emulation.
+
+### Determinism and Reproducibility
+
+If guest time advanced with the wall clock, two runs of the exact same game on the exact same host, but with different background CPU loads, would execute different numbers of instructions between timer ticks. The guest's internal state could diverge—a race condition in the guest code might crash on one run but not another.
+
+When time advances by cycles executed, the guest progresses in lockstep with its own hardware clocks. Given the same starting state and the same instruction stream, the emulator will *always* hit the exact same instruction at the exact same simulated millisecond, regardless of whether the host CPU is running at 10% or 100% utilization. Wall-clock variability never influences the guest's internal timeline.
+
+### What Wall-Clock Time Is Actually For
+
+If cycle-based advancement is the engine, where does wall-clock time fit in? As covered in §3.9 (`increaseticks()`), wall-clock time is purely a **governor** and a **feedback mechanism**—not the mechanism of progression:
+
+<Diagram src="03-2-wall-clock-role.svg" />
+
+Each call to `increaseticks()` asks a single question — has at least one real millisecond elapsed since the last check? If **less than 1ms** has passed, that round of simulated milliseconds finished before the host clock ticked over; there's nothing new to measure yet, so the emulator sleeps briefly (`wrap_delay(1)`) rather than busy-spin, then checks again. If **1ms or more** has passed, that elapsed time is simply recorded (`ticksDone += ticksRemain`) — this is the ordinary path, taken on essentially every call, not a sign of trouble by itself. Only once roughly 250ms of real time has accumulated does §3.9's ratio get computed from that running total, and only then can `CPU_CycleMax` move — in either direction, up if the host has been keeping pace with slack to spare, down if it's genuinely been struggling.
+
+**In short:** Guest time is driven by cycles to preserve the exact order and relative timing of instructions and device events. Host wall-clock time is only used to *throttle* the emulator's execution speed so that it roughly matches human-perceptible real time. The CPU executes, and time *follows* that execution—time never leads the execution.
+
+
+---
+
+## 3.6 Host Wall-Clock Time
+
+*(The "Host milliseconds" box from §3.3's pipeline.)*
+
+The host system provides a monotonic clock that returns the number of milliseconds since some fixed epoch (usually system startup). In DOSBox-X, this clock is accessed via a macro:
+
+```c
+// include/timer.h
+#define GetTicks() SDL_GetTicks()
+```
+
+`SDL_GetTicks()` is a standard SDL function that returns a 32‑bit unsigned integer, wrapping after about 49 days. For all practical purposes within a single emulation session, it behaves as a monotonic, non‑decreasing millisecond counter.
+
+This is the *only* external reference DOSBox-X has for how much real time has passed. It is used for:
+- UI timing: debouncing key repeats, double‑click detection, focus change timestamps.
+- The main reconciliation loop: `increaseticks()` calls it to measure elapsed host time since the last check.
+- Title‑bar performance display: comparing `PIC_Ticks` against `GetTicks()` to show the emulation speed percentage.
+
+The host clock has a resolution that depends on the underlying OS and hardware—typically 1 ms on modern systems, but sometimes as coarse as 10 ms or more. This coarse granularity influences the design of the reconciliation logic (see §3.9), but the fundamental point is that `GetTicks()` is the ground truth for "how long did it actually take?"
+
+**Engineering observation:** DOSBox-X uses SDL's `GetTicks()` rather than higher-resolution host timers because emulators do not actually need microsecond precision for timekeeping. The granularity of host timekeeping only needs to match the granularity of the reconciliation loop. Using `SDL_GetTicks()` keeps the code portable and avoids platform-specific timer APIs.
+
+
+---
+
+## 3.7 The Cycle Budget
+
+*(The "Cycle budget" and "CPU execution" boxes from §3.3's pipeline.)*
+
+If guest time cannot be handed down from the wall clock, what *should* drive it?
+
+The only other thing DOSBox-X has to measure is how much guest work has actually been performed — and "guest work" is countable, because the CPU decoder consumes a specific number of cycles for every instruction it executes, exactly as a real CPU would (§3.1). So the answer falls out almost by elimination: **CPU cycles executed** become the unit of guest progress. DOSBox-X needs bookkeeping — plain variables, incremented as work happens — to track that unit at two different resolutions: whole completed milliseconds, and the partial progress within the current one.
+
+### Counting Completed Milliseconds: `PIC_Ticks`
+
+Inside DOSBox-X, the current guest time in whole milliseconds is stored in a global variable:
+
+```cpp
+// src/hardware/pic.cpp
+Bitu PIC_Ticks = 0;
+```
+
+Despite its name, `PIC_Ticks` is not a ticking hardware counter; it is a software-maintained count of how many *simulated* milliseconds have been completely processed. It increments by one each time the emulator finishes executing one millisecond's worth of CPU cycles. The increment happens inside `TIMER_AddTick()`:
+
+```cpp
+// src/hardware/pic.cpp, inside TIMER_AddTick()
+PIC_Ticks++;
+```
+
+But what defines "one millisecond's worth of CPU cycles"? That is governed by the cycle counters introduced in the next section. The important observation here is that `PIC_Ticks` is *not* derived directly from `GetTicks()`. It is an independent variable that the emulator advances on its own schedule, and only later does it compare that advancement against the host clock to see if it needs to speed up or slow down.
+
+<Diagram src="03-3-pic-ticks-progression.svg" />
+
+`PIC_Ticks` alone gives only the integer part of the current guest time. For finer granularity, we need the fractional part.
+
+*Pipeline check-in: the "Guest milliseconds" box from §3.3 now has a counter, but only a coarse one — it only advances in whole-millisecond jumps, once per completed batch. Filling in the gap between those jumps is what the next box, the cycle budget, is for.*
+
+### Accounting for Work Within a Millisecond: The Cycle Budget
+
+Within a single simulated millisecond, the CPU executes a certain number of cycles. These cycles are accounted for by three variables:
+
+```cpp
+// src/cpu/cpu.cpp
+cpu_cycles_count_t CPU_Cycles     = 0;
+cpu_cycles_count_t CPU_CycleLeft  = 3000;
+cpu_cycles_count_t CPU_CycleMax   = 3000;
+```
+
+*Throughout this chapter and the remainder of the book, the implementation refers to these accounting units as "cycles" because that is the terminology used throughout the DOSBox-X source code. The book intentionally follows the source code vocabulary to make it easier to cross-reference with the actual implementation.*
+
+- **`CPU_CycleMax`** — the total number of cycles allocated for the current millisecond. This is the "budget." When `cycles=auto` or `cycles=max` is used, this value is continuously adjusted by the auto‑cycle logic to keep emulation in sync with real time (see §3.9). When a fixed `cycles=3000` is set, `CPU_CycleMax` stays constant. The default of 3000 is the traditional DOSBox community default, historically calibrated to approximate a fast 286 or slow 386 for period‑appropriate software — a useful intuition pump, but worth taking as an analogy rather than an equivalence: a DOSBox cycle is a scheduling unit chosen so that "3000 of them" feels roughly period-appropriate, not a physical clock edge, and it doesn't correspond to any single real oscillator frequency the way "6 MHz" or "12 MHz" would for an actual 286 or 386.
+- **`CPU_CycleLeft`** — the number of cycles remaining in the current millisecond's budget that have not yet been handed out to any instruction batch.
+- **`CPU_Cycles`** — the number of cycles in the current batch that are still *unexecuted*. The batch is decremented live as instructions run:
+
+A batch doesn't appear from nowhere — it's carved directly out of `CPU_CycleLeft`. Handing out a batch of any size N means `CPU_CycleLeft -= N` happens in the same step that `CPU_Cycles` is set to N: the two counters are conservation partners, not independent pools, so the millisecond's total budget never grows or shrinks, it only moves between "not yet handed out" and "currently in flight." What *size* a batch is — why 300 cycles rather than all 1800 remaining — is a scheduling decision this chapter deliberately leaves alone; it belongs to `PIC_RunQueue()` and is covered fully in @chapter(main-loop-and-event-scheduler). All this chapter needs is the accounting identity: carved out of `CPU_CycleLeft`, spent live by the decoder, and whatever's left folded back in once the batch ends.
+
+> **Execution budget is permission, not obligation.** `CPU_CycleMax` being 3000 does not mean the CPU decoder will execute exactly 3000 instructions this millisecond. It means the decoder *may* consume up to 3000 cycles' worth of work before the millisecond is considered spent. A batch handed to the decoder can end early — a scheduled device event due partway through it will cut the batch short, well before its nominal size is exhausted (@chapter(main-loop-and-event-scheduler) covers how `PIC_RunQueue()` decides batch sizes for exactly this reason). Whatever cycles a batch didn't use simply aren't spent; they don't roll over, they don't get made up later, they just weren't needed. This is worth internalizing now, because it resolves a natural but incorrect assumption: that assigning a cycle budget is the same as guaranteeing that many instructions run. It isn't. It's an upper bound the decoder is free to spend less than.
+
+```cpp
+while (CPU_Cycles-- > 0) {
+    // execute one instruction
+}
+```
+
+At any instant, `CPU_Cycles` holds the remainder of the current batch.
+
+The total number of cycles already consumed in this millisecond is:
+
+```text
+cycles_used = CPU_CycleMax - CPU_CycleLeft - CPU_Cycles
+```
+
+This is a simple accounting identity: start with the total budget, subtract all cycles that have not yet been used (whether they are still in the current batch or not yet handed out).
+
+DOSBox-X never tracks executed cycles directly — there's no CPU_CyclesExecuted variable anywhere in the source. That's only safe because CPU_CycleMax is a true constant for the duration of a single millisecond: it's set once at the top of the millisecond, and the only place that ever revises it is increaseticks() (§3.9), which runs at a millisecond boundary, after TIMER_AddTick() has already reset CPU_CycleLeft and CPU_Cycles for the next one. So within any given millisecond, "total minus the two things actually tracked" is guaranteed to equal "what got executed" — there's no window where CPU_CycleMax could shift out from under that subtraction and make the derived value wrong. Recomputing Executed from a constant and two live counters, on demand, is cheaper and simpler than maintaining a fourth variable in lockstep with the other three — and it's the same trick PIC_TickIndex() builds on to produce "now" without a dedicated clock variable at all.
+
+<Diagram src="03-4-cycle-accounting-ms.svg" />
+
+<Diagram src="03-6-time-02-cycle-accounting.svg" />
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    CYCLE ACCOUNTING WITHIN A MILLISECOND                  │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│                    ONE SIMULATED MILLISECOND                              │
+│                 (CPU_CycleMax = 3000 cycles)                              │
+│                                                                            │
+│  CPU_CycleMax = 3000 (total budget — the only quantity actually fixed)    │
+│                                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        3000 CYCLES                                 │   │
+│  │                                                                     │   │
+│  │  ◄──── Executed ────► ◄─ CPU_Cycles ─► ◄──── CPU_CycleLeft ────►  │   │
+│  │       1200 cycles         300 cycles         1500 cycles           │   │
+│  │                                                                     │   │
+│  │       DERIVED,             TRACKED               TRACKED           │   │
+│  │      not stored          (batch left            (not yet           │   │
+│  │                            to run)               handed out)       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│           start of millisecond ────────────────────► end of millisecond   │
+│                                                                            │
+│  Only CPU_CycleLeft and CPU_Cycles are real variables. "Executed" is      │
+│  whatever's left over once both are subtracted from the fixed total —    │
+│  there is no variable that counts executed cycles directly:              │
+│                                                                            │
+│      Executed = CPU_CycleMax - CPU_CycleLeft - CPU_Cycles                │
+│               =    3000      -     1500      -    300                   │
+│               =    1200                                                  │
+│                                                                            │
+│  PIC_TickIndex() just divides that derived value by the total:           │
+│                                                                            │
+│      PIC_TickIndex() = Executed / CPU_CycleMax                           │
+│                       = (CPU_CycleMax - CPU_CycleLeft - CPU_Cycles)       │
+│                          / CPU_CycleMax                                  │
+│                                                                            │
+│  At start:  (3000 - 3000 - 0) / 3000 = 0.0                               │
+│  After 1200 cycles: (3000 - 1500 - 300) / 3000 = 0.4                     │
+│  At end:    (3000 - 0 - 0) / 3000 = 1.0                                  │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+*Pipeline check-in: we've now reached the second and third boxes of the pipeline from §3.3. The host has supplied real elapsed time (§3.6); DOSBox-X has converted it into a budget of guest work, and that budget is being spent live, instruction by instruction, as `CPU_Cycles` and `CPU_CycleLeft` change. What's still missing is turning "how much of the budget is spent" into an actual point in simulated time — that's the next section.*
+
+---
+
+## 3.8 Turning Work into Simulated Time {#turning-work-into-simulated-time}
+
+*(The "Guest milliseconds" box from §3.3's pipeline — specifically, its fractional part.)*
+
+Once DOSBox-X knows how much work has been completed — via the counters just introduced — it can estimate how much of the current simulated millisecond has elapsed, and combine that with the completed-millisecond count to produce a single, continuous "now" for the guest.
+
+### From Cycles Consumed to a Millisecond Fraction: `PIC_TickIndex()`
+
+Worth restating before the code below: **CPU cycles are execution budget, not a clock.** What follows is the mechanism that turns spent budget into an actual timestamp — the step where "how much work happened" becomes "what time it is."
+
+Dividing by `CPU_CycleMax` yields the fraction of the millisecond that has elapsed:
+
+```c
+// include/pic.h
+static INLINE pic_tickindex_t PIC_TickIndex(void) {
+    return ((pic_tickindex_t)(CPU_CycleMax - CPU_CycleLeft - CPU_Cycles)) /
+           ((pic_tickindex_t)CPU_CycleMax);
+}
+```
+
+The type `pic_tickindex_t` is defined as a floating‑point type:
+
+```c
+#if defined(HAS_LONG_DOUBLE)
+typedef long double pic_tickindex_t;
+#else
+typedef double pic_tickindex_t;
+#endif
+```
+
+Thus `PIC_TickIndex()` returns a genuine floating‑point fraction between 0.0 (start of millisecond) and just under 1.0 (end of millisecond). This fractional part, added to the integer `PIC_Ticks`, gives the complete guest timestamp:
+
+```c
+// include/pic.h
+static INLINE pic_tickindex_t PIC_FullIndex(void) {
+    return (pic_tickindex_t)PIC_Ticks + PIC_TickIndex();
+}
+```
+
+`PIC_FullIndex()` is the **authoritative "now"** in DOSBox‑X. It is a continuous, monotonically increasing value measured in milliseconds, with sub‑millisecond precision. There is no separate global variable holding this timestamp; it is recomputed on demand from the live counters. This approach ensures that the timestamp always reflects the exact progress of CPU execution, including any dynamic adjustments to `CPU_CycleMax` or temporary stalls.
+
+<Diagram src="03-5-reconstructing-now-timestamp.svg" />
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    RECONSTRUCTING THE "NOW" TIMESTAMP                     │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  PIC_Ticks (integer ms)    +    PIC_TickIndex() (fraction)                │
+│  ┌─────────────────┐            ┌─────────────────┐                       │
+│  │       12345     │            │      0.4        │                       │
+│  └─────────────────┘            └─────────────────┘                       │
+│         │                              │                                   │
+│         └──────────────┬───────────────┘                                   │
+│                        │                                                   │
+│                        ▼                                                   │
+│              ┌─────────────────────┐                                       │
+│              │   PIC_FullIndex()   │                                       │
+│              │      12345.4        │                                       │
+│              │   guest milliseconds│                                       │
+│              │   since boot        │                                       │
+│              └─────────────────────┘                                       │
+│                                                                            │
+│  There is no single variable holding this value. It is recomputed          │
+│  on demand from the live counters.                                        │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Engineering observation:** Recomputing the timestamp on demand rather than maintaining it ensures internal consistency. If `PIC_Ticks` were updated independently of the cycle counters, a device event could read a timestamp that disagrees with what the budget has actually spent. By deriving the timestamp from the live counters, DOSBox-X guarantees the timestamp and the budget are always in agreement.
+
+`PIC_TickIndex()` converts cycles already spent into a millisecond fraction. The conversion runs in the other direction too, whenever a device needs to express a delay — a fractional number of milliseconds from now — as a number of cycles instead:
+
+```c
+// include/pic.h
+static INLINE Bits PIC_MakeCycles(const pic_tickindex_t amount) {
+    return (Bits)((pic_tickindex_t)CPU_CycleMax * amount);
+}
+```
+
+This is the conversion the event queue itself is built on — a scheduled delay, expressed in fractional ticks, only becomes a decision about how many cycles the CPU may run through `PIC_MakeCycles()`-equivalent arithmetic. The queue entries themselves aren't stored as absolute `PIC_FullIndex()`-style timestamps, though; they're a relative countdown against the current position within the millisecond, aged down as each millisecond completes. That mechanism — along with a division-free sibling of `PIC_TickIndex()` the scheduler uses internally — belongs to the event scheduler itself, covered in @chapter(main-loop-and-event-scheduler).
+
+### Why Time Isn't Stored
+
+DOSBox-X does not maintain a continuously updated "current guest time" variable. Instead, the current timestamp is reconstructed from:
+
+```text
+PIC_FullIndex() = PIC_Ticks + PIC_TickIndex()
+```
+
+This design choice may seem counterintuitive—why recompute a value every time instead of storing it? The benefits become clear when you consider the alternative.
+
+If DOSBox-X maintained a global `current_time` variable, it would need to update it constantly. Every time the CPU executed a cycle, every time a device fired an event, every time the scheduler checked a deadline—the variable would have to be written. This creates opportunities for inconsistency: a device event could fire at a time that doesn't match the cycle counter, or the scheduler could compare against a timestamp that was last updated before the current batch of instructions executed.
+
+By deriving `PIC_FullIndex()` from the live counters, DOSBox-X achieves:
+
+- **No duplicate state** — there is only one source of truth for the budget (the three cycle counters) and one source of truth for completed milliseconds (`PIC_Ticks`).
+- **Always internally consistent** — the timestamp always reflects exactly how many cycles have been executed, no more and no less.
+- **Natural incorporation of changes** — if `CPU_CycleMax` is adjusted mid-millisecond (as happens during auto-adjustment), the timestamp immediately reflects the new budget without any separate update.
+- **Simplicity** — there is no need to write code that keeps a global timestamp in sync.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                   WHY TIME IS DERIVED, NOT STORED                        │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Alternative (stored):                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  global current_time = 12345.4                                     │   │
+│  │  Must be updated:                                                  │   │
+│  │   • after every CPU instruction                                    │   │
+│  │   • after every device event                                       │   │
+│  │   • whenever CPU_CycleMax changes                                  │   │
+│  │   Risk: inconsistent with actual execution                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+│  DOSBox-X (derived):                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PIC_FullIndex() = PIC_Ticks + PIC_TickIndex()                     │   │
+│  │  No global variable. Always recomputed from live counters.         │   │
+│  │  Always consistent with execution state.                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+This is a common pattern in well-designed emulators: time is a *derived quantity* rather than a *stored state*. The guest's sense of time emerges from the execution of instructions rather than being maintained separately.
+
+### The Conceptual Inversion: Host Time vs. Guest Work
+
+The relationship between host time and guest time in DOSBox-X represents a subtle but important conceptual inversion. Unlike a physical IBM PC, where the oscillator determines how many instructions can execute in a unit of time, DOSBox-X starts with a configurable execution budget expressed in guest cycles per host millisecond. Guest time is then reconstructed from the amount of work completed within that budget.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    PHYSICAL PC vs. DOSBox-X TIME MODEL                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Physical IBM PC:                                                         │
+│                                                                            │
+│   Oscillator ticks                                                        │
+│        │                                                                   │
+│        ▼                                                                   │
+│   CPU executes instructions                                               │
+│        │                                                                   │
+│        ▼                                                                   │
+│   Time passes                                                             │
+│                                                                            │
+│  ───────────────────────────────────────────────────────────────────────── │
+│                                                                            │
+│  DOSBox-X:                                                                 │
+│                                                                            │
+│   Host time passes                                                        │
+│        │                                                                   │
+│        ▼                                                                   │
+│   CPU_CycleMax defines execution budget per host millisecond              │
+│        │                                                                   │
+│        ▼                                                                   │
+│   CPU executes guest cycles                                               │
+│        │                                                                   │
+│        ▼                                                                   │
+│   Guest time is reconstructed from work completed                         │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+This is why `CPU_CycleMax` is such a fundamental variable. It is the bridge between **host time** and **guest work**:
+
+```
+  Host millisecond
+         │
+         ▼
+  CPU_CycleMax = N
+         │
+         ▼
+  N guest cycles executed
+         │
+         ▼
+  Guest time advances
+```
+
+The host provides a time budget, the configuration defines how much work fits into that budget, and guest time emerges from the work performed.
+
+It's worth being precise here, because this is one of the easiest places in the whole timing model to get backwards: **`CPU_CycleMax` is execution budget, not a clock speed.** Raising it does not make `PIC_Ticks` tick over any faster. As §3.9 will show in detail, `increaseticks()` paces guest-millisecond completion against the host clock — one `TIMER_AddTick()` roughly once per real millisecond — regardless of what `CPU_CycleMax` is set to, as long as the host can keep up. What `CPU_CycleMax` actually controls is *how much guest work* (how many emulated instructions) gets packed into that next, still-roughly-one-real-millisecond-long guest millisecond — the instruction throughput of the emulated machine, not the rate at which its clock advances. Doubling `CPU_CycleMax` is closer to doubling the emulated CPU's MHz than to running the same CPU's clock twice as fast: the guest still experiences "1 millisecond passing" once per real millisecond either way; it simply gets to do twice as much emulated work inside that millisecond. (If the host genuinely can't keep up with the larger budget, the effect is the opposite of "faster": guest milliseconds take *longer* than one real millisecond to complete, and the guest falls behind wall-clock time — see §3.9's discussion of a saturated host.)
+
+Think of `CPU_CycleMax` as controlling the density of guest work packed into each host millisecond — it doesn't stretch or compress time itself, but determines how much emulated CPU work the guest gets to perform per real-world tick.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    EFFECT OF INCREASING CPU_CYCLEMAX                      │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  CPU_CycleMax = 3000                CPU_CycleMax = 6000                   │
+│                                                                            │
+│  1 guest millisecond                1 guest millisecond                   │
+│  (~1 real millisecond, either way — increaseticks() paces both the same) │
+│       │                                  │                                 │
+│       ▼                                  ▼                                 │
+│  guest executes:                    guest executes:                      │
+│  ┌─────────────────────┐            ┌─────────────────────┐               │
+│  │   3000 cycles of     │            │   6000 cycles of     │               │
+│  │  emulated instructions│            │  emulated instructions│               │
+│  └─────────────────────┘            └─────────────────────┘               │
+│       │                                  │                                 │
+│       ▼                                  ▼                                 │
+│  PIC_Ticks advances by 1           PIC_Ticks advances by 1                │
+│  either way, once per real ms      either way, once per real ms          │
+│                                                                            │
+│  What changes is NOT the rate PIC_Ticks advances — it's how much guest    │
+│  instruction throughput fits inside each of those milliseconds. More      │
+│  cycles per ms means a "faster" emulated CPU, not a faster guest clock.   │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+This is why the design choice that time is derived from execution rather than stored as an independent clock is still powerful, even though `CPU_CycleMax` isn't a clock-speed knob: it lets the emulator express "how much emulated CPU work happened" and "what time is it now" as two views of the same underlying counters, without needing them to agree on a rate in advance. §3.9 is the mechanism that keeps the *pacing* — milliseconds per real second — locked to the host clock; `CPU_CycleMax` only ever governs the *sizing* — how much work each of those milliseconds contains.
+
+*Pipeline check-in: the pipeline has now turned completed CPU work into a genuine simulated timestamp — `PIC_FullIndex()` is the "Guest milliseconds" box, fully formed, integer and fractional parts together. Virtual hardware could read this value and know exactly when "now" is. The one thing still unguaranteed is that this simulated clock keeps pace with the host's — that guarantee is what §3.9 provides.*
+
+---
+
+## 3.9 Keeping the Simulation Synchronized
+
+*(The arrow itself, from §3.3's pipeline — the one connecting "Host milliseconds" to everything below it, which has to be checked and corrected continuously or the two ends drift apart.)*
+
+Now that we have a way to measure guest time (`PIC_FullIndex()`) and host time (`GetTicks()`), the emulator must ensure that guest time advances at approximately the same rate as host time. This reconciliation is exactly where the chapter's recurring warning matters most: **CPU cycles are execution budget, not a clock** — and reconciliation is the machinery that makes that true, by adjusting the *size* of the budget rather than ever touching the timestamp's rate directly. This happens in the `increaseticks()` function, which is called from the main loop after the CPU has exhausted the current millisecond's cycle budget — the inevitable consequence of everything established so far: guest time is derived from work done (§3.7–3.8), so *something* has to periodically check that derived value against the one real clock available (§3.6) and correct course.
+
+Before the mechanics, it's worth being explicit about *why* this reconciliation adjusts the budget at all, rather than leaving `CPU_CycleMax` fixed the way `cycles=NNNN` does. A fixed budget forces a choice made once, by a human, at configuration time — and that choice can't know in advance how demanding this particular host, running this particular guest program, actually is. Set it too low and a fast host sits idle, running the guest slower than it could. Set it too high and a slow host can't keep up, and the guest falls behind real time — stuttering audio, sluggish input, dropped frames. `cycles=auto` exists to make that trade-off continuously, instead of once: its goal is to keep the guest's instruction throughput as high as the host can sustain, while still keeping guest milliseconds paced to real milliseconds — deliberately not pushing all the way to the host's ceiling, so there's headroom left for the host OS, other processes, and momentary spikes in the guest's own workload. That's the "~90% utilization" target that shows up repeatedly in the feedback law below: not a magic number, but a chosen margin between "as fast as this host can go" and "reliably keeping pace."
+
+**Naming caveat:** In the current source tree (commit `192c1756`), `increaseticks` is a top-level function at `src/dosbox.cpp:566` (`void increaseticks()`), forward-declared alongside the other function prototypes at `dosbox.cpp:320`. It is called from `Normal_Loop` at `dosbox.cpp:520` whenever the CPU has exhausted its cycle budget and no emulated milliseconds are pending drain (`ticksRemain == 0`). It is the single reconciliation checkpoint where wall-clock time is sampled and `CPU_CycleMax` is retuned. It is the bridge between host wall-clock time (domain 1) and simulated guest time (domain 2) — everything else in the emulator (PIC events, CPU decode, IO delay, audio ticking) is paced by the budget that this function produces.
+
+The three time domains this reconciliation juggles were already laid out in §3.4; `increaseticks()` only ever touches the boundary between domain 1 (host wall-clock) and domain 2 (simulated guest milliseconds).
+
+### Shared State: What `increaseticks()` Reads and Mutates
+
+All of these variables are file-scope in `dosbox.cpp` (`src/dosbox.cpp:294–319`); they are the function's memory across calls:
+
+- **`ticksRemain`** (`uint32_t`, static at `dosbox.cpp:309`) — the bridge variable. How many emulated milliseconds are "due" but not yet drained. Produced here, consumed in the drain path at `dosbox.cpp:516–518`.
+- **`ticksLast`** (`uint32_t`, static at `dosbox.cpp:311`) — last `GetTicks()` sample; the reference for the next delta.
+- **`ticksAdded`** (`uint32_t`, static at `dosbox.cpp:315`) — the capped ms added this round; deferred by one round into `ticksScheduled` (line 580 runs before the new delta is computed).
+- **`ticksScheduled`** (`uint32_t`, file-scope at `dosbox.cpp:295`) — accumulated emulated ms budget handed to the CPU over the sampling window. Numerator side of the ratio.
+- **`ticksDone`** (`int32_t`, file-scope at `dosbox.cpp:294`) — accumulated real ms elapsed over the window. Denominator. **Note the signed type**: stalls debit it in the sleep branch (`dosbox.cpp:605`).
+- **`ticksLocked`** (`bool`, file-scope at `dosbox.cpp:296`) — turbo / fast-forward override; short-circuits the whole function.
+
+Two decoys sharing the file trip people up:
+- `Ticks` (file-scope at `dosbox.cpp:316`) is used only by the title-bar / frames overlay at `dosbox.cpp:436–452` (`GFX_SetTitle`, FPS pacing). It is unrelated to tick reconciliation — the name is the trap.
+- `ticksLastFramecounter`, `ticksLastRTcounter`, `ticksLastRTtime` (`dosbox.cpp:312–314`), and `rtdelta` (`dosbox.cpp:317`) belong to that same overlay.
+
+### Where `increaseticks` Sits in the Main Loop
+
+`increaseticks()` isn't called from just anywhere — it's reached from one specific branch of the main loop, and only when two conditions both hold: the CPU has exhausted its cycle budget for the current millisecond, *and* no already-due emulated millisecond is waiting to be drained. @chapter(main-loop-and-event-scheduler) covers that loop's full structure; the one fragment worth quoting here is the branch that leads to this function:
+
+```c
+// dosbox.cpp:520, inside Normal_Loop's host path
+if (!paused && ticksRemain > 0) {
+    TIMER_AddTick();        // a millisecond is already due — spend it, don't reconcile yet
+    ticksRemain--;
+} else {
+    increaseticks();        // nothing due — this is the reconciliation checkpoint
+    return 0;
+}
+```
+
+**Engineer insight:** When `increaseticks()` returns, `Normal_Loop` returns `0` right behind it, which `DOSBOX_RunMachine`'s `do{}while(!ret)` immediately re-dispatches back into `Normal_Loop`. So the function is a checkpoint that yields to the outer driver rather than looping internally — the wall-clock sample is taken at most once per CPU-budget exhaustion, and on most passes the "nothing due" check is nothing more than a cheap `GetTicks()` diff.
+
+<Diagram src="03-7-increaseticks-flow.svg" />
+
+### Scenarios: The Life of the `increaseticks()` Function
+
+The walkthrough uses a scenario-based approach to build intuition, showing *why* the code is written the way it is, not just *what* it does. The five scenarios below cover the normal operational cases.
+
+#### Scenario A — Steady State (the baseline: host keeps time with the guest)
+
+*Setup: `cycles=auto`, host fast enough that each emulated ms of work takes ≤ 1 real ms, `CPU_CycleMax` already stable, not in turbo.*
+
+1. `PIC_RunQueue()` returns true (budget > 0). The decoder runs `CPU_Cycles` worth of guest instructions. Because the host is fast, it finishes in, say, 0.4 real ms, returning with `CPU_CycleLeft + CPU_Cycles <= 0`.
+2. `PIC_RunQueue()` next pass returns false → host path. `GFX_Events()` pumps SDL. `ticksRemain` is 0 (0.4 ms &lt; 1 ms resolution of `SDL_GetTicks`, so no new real ms has ticked on `ticksLast`).
+3. `increaseticks()`: `ticksNew = GetTicks()` (`dosbox.cpp:579`). Because of 1 ms resolution, `ticksNew == ticksLast` here. The else branch at `dosbox.cpp:583` fires: `ticksAdded = 0`, `SDL_Delay(1)` (sleep ~1 ms, `dosbox.cpp:586`), then `ticksDone -= (GetTicks() - ticksNew)` (`dosbox.cpp:605`) — it debits the real time spent sleeping so the sampling window doesn't count host-idle time as "work done." `ticksDone` clamps to 0 (`dosbox.cpp:607-608`).
+4. Function returns → `return 0` → `RunMachine` re-enters → `Normal_Loop` → `PIC_RunQueue()` is again false (no refill yet) → host path → now 1 ms has actually elapsed since `ticksLast`, so `ticksNew > ticksLast`. `ticksRemain = 1`. Drain: `TIMER_AddTick()` (one guest ms, budget refilled to `CPU_CycleMax`), `ticksRemain = 0`. Back to decoding.
+
+**Result:** One emulated ms per ~1 real ms, paced by the 1 ms sleep. The guest is never starved and never run ahead. The controller is waiting for the host clock, not predicting it.
+
+**Engineer insight:** The sleep at `dosbox.cpp:586` is negative feedback that prevents a fast host from busy-spinning at 100% CPU. The `ticksDone -= …` debit at `dosbox.cpp:605` is the subtle part — without it, the sleeping time would pollute the throughput measurement and make the auto-adjust think the host is slow.
+
+<Diagram src="03-9-increaseticks-scenario-a.svg" />
+
+#### Scenario B — After a host stall (catch-up via the drain loop)
+
+*Setup: The OS descheduled the process for, say, 8 real ms. `ticksRemain` was 0 when we stalled.*
+
+1. Decoder exhausted, host path, `ticksRemain == 0` → call `increaseticks()`.
+2. `ticksNew = GetTicks()`. Now 8 ms have passed: `ticksNew - ticksLast = 8`. `ticksRemain = 8`; `ticksDone += 8`; the > 20 cap is not hit, so `ticksRemain` stays 8; `ticksAdded = 8`.
+3. Function returns → `return 0` → re-enter `Normal_Loop` → host path → `ticksRemain (8) > 0` → drain loop: `TIMER_AddTick()` eight times in a tight burst (each one advances `PIC_Ticks` by 1, refills `CPU_CycleLeft += CPU_CycleMax + CPU_Cycles`, runs ticker handlers), `ticksRemain → 0`.
+4. Next exhaustion → host path → `ticksRemain == 0` → call `increaseticks()` → fresh sample.
+
+So the stall is reconciled, not skipped: 8 real ms become 8 emulated ms of work, bursted to catch up. Two critical limits bound this:
+
+- **The 20-cap** at `dosbox.cpp:627-629`: if the gap were, say, 60 ms (long deschedule), `ticksRemain` is clamped to 20. So at most 20 ms of catch-up is drained per `increaseticks` pass. This prevents a 5-second GC stall from dumping 5 seconds of device callbacks (PIT rollovers, audio fills, IRQ firing) as one undifferentiated instant. The remaining backlog is re-sampled next pass and continues draining at 20-per-iteration until caught up.
+- **The drift is bounded:** because `ticksRemain` is derived from real elapsed time each pass, the drain rate self-limits to real-time. It catches up monotonically; it never "borrows" future guest ms.
+
+**Engineer insight:** The 20-cap is a smoothing clamp on the second derivative of guest time, not a rate limit on guest speed. It answers the question "how much discontinuity can a single host hiccup inflict on the guest?" — capped at 20 ms of events.
+
+There is also a **fast preemption cut** at `dosbox.cpp:712-718`: if a single gap was > 15 ms (`ticksAdded > 15`) but the window is still tiny (`ticksScheduled < 5`, i.e. we haven't yet accumulated a 250 ms sample), the function slashes `CPU_CycleMax /= 3`. This fires once, early, on a freshly-detected deschedule — before the full-window ratio logic would kick in. It is the branch the book calls the "drastic cut," and it deliberately does not reset `ticksScheduled` / `ticksDone` so the next window still feels this stall. Floor is `CPU_CYCLES_LOWER_LIMIT` (200, `include/cpu.h:32`).
+
+#### Scenario C — The host is ahead (guest idle / HLT): the negative `ticksDone` debit
+
+This is the mirror of B and where `ticksDone`'s signedness earns its keep.
+
+1. Guest executes `HLT` (`CPU_HLT`, `src/cpu/cpu.cpp:3269`, which sets `cpudecoder = HLT_Decode` at `cpu.cpp:3281`, zeroes `CPU_Cycles`, and adds the abandoned cycles to `CPU_IODelayRemoved` (`cpu.cpp:3276`).
+2. `PIC_RunQueue()` next returns false (budget drained by the HLT). Host path, `ticksRemain == 0` (not enough real ms) → call `increaseticks()`.
+3. `ticksNew == ticksLast` (sub-ms elapsed) → else branch (`dosbox.cpp:583`): `ticksAdded = 0`, `SDL_Delay(1)` (`dosbox.cpp:586`), then `ticksDone -= (GetTicks() - ticksNew)` (`dosbox.cpp:605`). The 1 ms sleep subtracts 1 from `ticksDone`.
+
+Why subtract? Because `ticksDone` is the window's "real time the host actually spent" accumulator. While the guest is halted, the host isn't doing useful emulation work — it's sleeping. Counting that sleep as "done" would make the controller think the host is slow (`ticksDone` inflated → ratio low → cut `CPU_CycleMax`), which is exactly wrong. The debit keeps the throughput measurement to productive wall time. It clamps at 0.
+
+**Engineer insight:** This is a dead-time compensation trick. HLT / IO-delay time is host wall time the guest chose not to use; removing it from the sample yields a throughput estimate of "cycles delivered per ms the host was *actually* decoding," which is what you want to size the next budget.
+
+#### Scenario D — Fixed `cycles=` (auto-adjust disabled)
+
+When the user sets a literal `cycles=3000` (or `max` with auto off), `CPU_CycleAutoAdjust` is false (`cpu.cpp:217` init). The `increaseticks()` function still runs on every "nothing due" pass (`dosbox.cpp:520`):
+
+- `ticksScheduled += ticksAdded` (`dosbox.cpp:580`), `ticksRemain` / `ticksDone` updated, the 20-cap and drain still apply (guest time still tracks wall clock — real-time pacing is independent of auto-adjust).
+- The entire auto-adjust section (`dosbox.cpp:633-718`, gated by the `if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust) return;` at `dosbox.cpp:633`) is skipped. `CPU_CycleMax` is never touched here. The guest's ms budget is a constant; host speed only affects how long the session takes in real time, not guest timing.
+
+So even in fixed mode, `increaseticks` is the governor (sleep / drift-recovery) — just not the feedback (budget resize). That separation — **pacing vs. sizing** — is the central design point the rest of the chapter refers to.
+
+#### Scenario E — Turbo / fast-forward (the `ticksLocked` short-circuit)
+
+`ticksLocked` is set by `DOSBOX_UnlockSpeed` (`dosbox.cpp:763`, the "speedlock" mapper binding) and by the `turbo` config key. The function's very first branch (`dosbox.cpp:569-577`) is:
+
+```cpp
+if (GCC_UNLIKELY(ticksLocked)) {          // dosbox.cpp:569 — For Fast Forward Mode
+    ticksRemainSpeedFrac = 0;              // dosbox.cpp:570
+    ticksRemain = 5;                       // dosbox.cpp:571
+    /* Reset any auto cycle guessing for this frame */
+    ticksLast = GetTicks();                // re-anchor the sample (discard stale gap)
+    ticksAdded = 0;                        // dosbox.cpp:574
+    ticksDone = 0;                         // dosbox.cpp:575
+    ticksScheduled = 0;                    // dosbox.cpp:576
+    return;                                // dosbox.cpp:577
+}
+```
+
+This bypasses wall-clock measurement entirely. It forces `ticksRemain = 5` every pass, so the drain loop fires `TIMER_AddTick()` five times unconditionally → guest time races ahead of real time (fast-forward). It also zeroes the auto-adjust accumulators so the ratio logic never fires — the book's "skip the real-time check in `increaseticks()`." If auto-adjust happened to be active when Fast Forward toggled on, `DOSBOX_UnlockSpeed` suspends it (saves `CPU_CycleAutoAdjust=false`, cuts `CPU_CycleMax /= 3` floored at 1000) and restores it on release (`dosbox.cpp:791-798`).
+
+**Engineer insight:** The "5" is an arbitrary "racing" constant — not a target ratio. Fast-forward here is literally "spin the guest 5 ms further per real ms the host chooses to grant," bounded only by the host's raw throughput. That's why `dosbox.cpp:771`'s comment about `CPU_CycleMax /= 3` surfaces: with the budget shrunk and auto-suspended, each fast-forwarded ms is cheap, so the host can push the guest far ahead.
+
+### Full Coverage: The Auto-Adjustment Feedback Law
+
+<Diagram src="03-8-increaseticks-flow.svg" />
+
+This is the detailed implementation of the feedback law whose high-level shape was sketched in the three scenarios of §3.9.3. The feedback law triggers only when `CPU_CycleAutoAdjust && !CPU_SkipCycleAutoAdjust` (i.e. the guard at `dosbox.cpp:633` does **not** return early) and one of three window conditions is met (`dosbox.cpp:636`):
+
+```cpp
+if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5))
+```
+
+Three trigger modes:
+
+- **`ticksScheduled >= 250`** — a normal ~250 ms sliding window has accumulated. This is the routine retune cadence (every quarter-second).
+- **`ticksDone >= 250`** — 250 real ms elapsed even if fewer emulated ms were scheduled (a slow window). Same cadence, just measured on the wall side.
+- **`ticksAdded > 15 && ticksScheduled >= 5`** — a single gap > 15 ms, but at least 5 ms of work scheduled this window. This is the early-stall trigger: instead of waiting for a full 250 ms window to react to a 30 ms deschedule, retune immediately. The `ticksAdded > 15` is deliberately just under the 20-cap so a capped stall still trips it.
+
+Once inside, the math (`dosbox.cpp:637-672`):
+
+```cpp
+if(ticksDone < 1) ticksDone = 1;                       // div-by-zero guard
+int32_t ratio = (ticksScheduled * (CPU_CyclePercUsed*90*1024/100/100)) / ticksDone;
+```
+
+`CPU_CyclePercUsed` is the user's "max % of real speed" knob (default 100, range 1–105 via the cycles +/- hotkeys, `cpu.cpp:3337/3372`). The constant `90*1024/100/100 = 9.216`, so the multiplier is `CPU_CyclePercUsed * 9.216`; at the default that's 921.6 → integer 921. So:
+
+```
+ratio = ticksScheduled * 921 / ticksDone  (at the default 100% setting)
+```
+
+and `ratio` lives in 1024 = 1.0× fixed point (the `/2048` below is `/2 × 1024`). Interpret it as a normalized throughput: `ticksScheduled / ticksDone` is "emulated ms per real ms" (instantaneous guest speed as a fraction of real time), and 921 folds in the 90% utilization target the comment (`dosbox.cpp:638`) names — i.e. the controller wants the guest to run at ~90% of wall-clock throughput, reserving ~10% headroom so a modern host isn't pinned at 100% and so a noisy scheduler doesn't immediately trigger a cut.
+
+Then the IO-delay correction (the subtle, correct part):
+
+```cpp
+int64_t cproc = (int64_t)CPU_CycleMax * (int64_t)ticksScheduled;   // total cycles budgeted this window
+double ratioremoved = (double)CPU_IODelayRemoved / (double)cproc; // fraction of budget lost to HLT/IO-wait
+if (ratioremoved < 1.0)
+    ratio = (int32_t)((double)ratio * (1 - ratioremoved));       // discount idle host time
+```
+
+`CPU_IODelayRemoved` (`src/cpu/cpu.cpp:214`) accumulates cycles abandoned to `HLT` / `ENTER` I/O-delay during the window. `cproc` is the gross cycle budget that was scheduled. `ratioremoved` is thus "what fraction of the programmed budget was never consumed by real decode work." Multiplying ratio by `(1 - ratioremoved)` asks: of the wall time spent, how much was actual decoding work vs. guest-chosen idle? Only the productive fraction counts toward throughput. This is why a game that `HLT`s a lot doesn't get misinterpreted as a "slow host" and get its budget cut.
+
+**Engineer insight:** This is a duty-cycle normalization — it measures decode-utilization, not wall-utilization, which is the right signal for sizing `CPU_CycleMax`.
+
+There are also hard anti-runaway clamps at `dosbox.cpp:649-660`:
+
+```cpp
+if (ticksScheduled >= 250 && ticksDone < 10 && ratio > 20480) ratio = 20480;
+```
+
+If the host reports essentially no real time (`ticksDone < 10` over 250 scheduled ms) but the ratio is implausible, cap it. This guards against `SDL_GetTicks()` resolution / scheduler artifacts producing a gigantic, bogus `CPU_CycleMax`.
+
+Now the resize itself. The actual formula has two branches (`dosbox.cpp:662-670`), selected by whether `ratio` is at or below 1.0× (1024 in fixed point):
+
+**Branch 1 — ratio ≤ 1024 (host too slow, budget needs to shrink):**
+
+```cpp
+if (ratio <= 1024) {
+    // ratio_not_removed = 1.0; //enabling this restores the old formula
+    double r = (1.0 + ratio_not_removed) / (ratio_not_removed + 1024.0 / (static_cast<double>(ratio)));
+    new_cmax = 1 + static_cast<int32_t>(CPU_CycleMax * r);
+}
+```
+
+**Branch 2 — ratio > 1024 (host has headroom, budget can grow):**
+
+```cpp
+else {
+    int64_t ratio_with_removed = (int64_t)((((double)ratio - 1024.0) * ratio_not_removed) + 1024.0);
+    int64_t cmax_scaled = (int64_t)CPU_CycleMax * ratio_with_removed;
+    new_cmax = (int32_t)(1 + (CPU_CycleMax >> 1) + cmax_scaled / (int64_t)2048);
+}
+```
+
+The shrink branch (ratio ≤ 1024) uses a direct multiplicative factor `r = (1 + ratio_not_removed) / (ratio_not_removed + 1024/ratio)` that maps the throughput gap onto a per-step scaling factor, then applies it directly. The grow branch uses a half-step blend: the new budget is the arithmetic mean of the old budget and the throughput-implied target, plus 1. Algebra for the grow branch:
+
+```
+new_cmax = 1 + CM/2 + (CM * ratio_with_removed)/2048 = 1 + (CM + CM·ratio_with_removed/1024)/2
+```
+
+where `ratio_with_removed` is the ratio adjusted back for the IO-delay fraction. Define the ideal target `T = CM * ratio/1024` (ratio is in /1024 units, so this divides back out). Then:
+
+```
+new_cmax = 1 + (CM + T)/2
+```
+
+This is a half-step blend toward the measured target: the new budget is the arithmetic mean of the old budget and the throughput-implied target, plus 1. It is the classic anti-hunting smoother — a 2:1 IIR. Consequences:
+
+- `new_cmax` is monotonically increasing in `ratio` (∂ = `CM/2048` > 0). So: high emulated-throughput-per-real-ms → raise `CPU_CycleMax`; low → lower it. Direction is unambiguous from the sign.
+- The 90% factor means at true 1:1 real-time pacing the target `T` lands ~9% below `CM`, so the controller sits slightly conservative by design — it wants headroom, not 100% saturation. The operating point is a slow oscillation around "the `CPU_CycleMax` where guest decode keeps the host at ~90% busy," held stable by the half-blend and the quarter-second window.
+- The commented-out `ratio_not_removed = 1.0` (`dosbox.cpp:661`) shows an earlier, sharper law was replaced with the smoother mean — a useful history signal: the maintainers deliberately moved away from an abrupt "shrink if ≤1×, grow if >1×" rule that could hunt.
+
+Two more guards gate the actual write-back (`dosbox.cpp:674-698`):
+
+```cpp
+if (new_cmax < CPU_CYCLES_LOWER_LIMIT) new_cmax = CPU_CYCLES_LOWER_LIMIT;   // 200
+if (ratio > 10) {                                                             // >1% only
+    if ((ratio > 120) || (ticksDone < 700)) {                             // skip during
+        CPU_CycleMax = new_cmax;                                      // heavy load
+        if (CPU_CycleLimit > 0) {
+            if (CPU_CycleMax > CPU_CycleLimit) CPU_CycleMax = CPU_CycleLimit;
+        }
+        else if (CPU_CycleMax > 2000000) CPU_CycleMax = 2000000; //Hardcoded limit
+    }
+}
+```
+
+- `ratio > 10` (≈1%) — drops below this (a near-zero denominator or a momentary blip) are treated as transient dropouts and skipped; no retune.
+- `ratio > 120 || ticksDone < 700` — "adjust if ratio is decent (>12%) or if we haven't accumulated much real time yet." In other words: cut `CPU_CycleMax` only when the host is genuinely and persistently behind (low ratio sustained past 700 ms). On a brief hiccup, `ticksDone < 700` keeps it from over-reacting.
+- `CPU_CYCLES_LOWER_LIMIT` (200, `include/cpu.h:32`) is the floor `new_cmax` is clamped to before the write-back. 200 cycles per millisecond is roughly 200,000 emulated instructions per second — low enough that essentially no host built since the 1990s fails to clear it. Once `CPU_CycleMax` is pinned there, the auto-adjust loop has no further lever to pull; the emulator simply runs at whatever fraction of real time 200 cycles/ms actually costs on that host, with guest audio and finely-timed I/O degrading accordingly, but the loop itself stays stable — no runaway, no divergence, no crash.
+- `CPU_CycleLimit` (`cpu.cpp:210`) — a config ceiling; if set (positive), `CPU_CycleMax` is hard-capped after the retune. If unset (`<= 0`), the fallback ceiling is `2000000` (`dosbox.cpp:699`).
+
+Then `CPU_IODelayRemoved = 0; ticksDone = 0; ticksScheduled = 0;` reset the window (`dosbox.cpp:703-708`). The next ~250 ms of behavior starts fresh, but `CPU_CycleMax` carries forward as the new baseline.
+
+The `else-if` at `dosbox.cpp:712` (`ticksAdded > 15` but window not yet triggered the 250 path) is the other fast cut: a >15 ms gap detected before the window is "ripe" but after 5 ms of work — halve-and-a-third via `/= 3` (`dosbox.cpp:718`). Distinct from the full ratio path: this one doesn't recompute a target, it just punishes the budget 3×. It is a coarse emergency brake; the fine-grained ratio path is the cruise control.
+
+**Engineer insight:** Read this as a two-tier regulator — a fast, coarse `/= 3` cut on raw stalls, and a slow, smoothed half-step toward a throughput target otherwise. The two share the same accumulators (`ticksDone` / `ticksScheduled`), but the `/= 3` path intentionally doesn't reset them, so a stall's evidence propagates into the next window's ratio. That coupling is deliberate: a stall both slashes the budget now and biases the next fine-tune toward "host was slow."
+
+#### Stateful Sleep Tracking and the Sleep Pattern
+
+```cpp
+static int32_t lastsleepDone = -1;
+static Bitu sleep1count = 0;
+```
+
+The function maintains persistent state across calls to track sleep behavior. The `sleep1count` variable increments when a 1 ms sleep actually took 1 ms, and `lastsleepDone` tracks the `ticksDone` value at which the sleep pattern was last reset. This state enables a feedback loop that monitors the quality of host sleeps, introducing randomness when sleeps are consistently too coarse.
+
+When the emulator is ahead of real time and auto-adjustment is active, it doesn't simply sleep for 1 ms every time:
+
+```cpp
+static const uint32_t sleeppattern[] = { 2, 2, 3, 2, 2, 4, 2 };
+static uint32_t sleepindex = 0;
+if (ticksDone != lastsleepDone) sleepindex = 0;
+wrap_delay(sleeppattern[sleepindex++]);
+```
+
+On some host systems, `SDL_Delay(1)` always rounds up to a fixed value (e.g., 10 ms due to timer granularity). If the emulator always called `SDL_Delay(1)`, it might consistently over-sleep, causing the emulator to run too slow. By varying the sleep duration across a pattern of 2 ms, 2 ms, 3 ms, 2 ms, 2 ms, 4 ms, 2 ms, DOSBox-X avoids locking into a bad timing rhythm. The pattern resets when `ticksDone` changes, aligning with the 250 ms adjustment window.
+
+The `sleep1count < 3` condition in the earlier check means the first few sleeps are always 1 ms. Only after three consecutive 1 ms sleeps does the pattern activate. This allows the emulator to initially attempt the most efficient sleep and only introduce randomness if the system proves unreliable.
+
+**Engineer insight:** The 1 ms sleep is negative feedback preventing a fast host from busy-spinning at 100% CPU. The `ticksDone -= …` debit prevents sleeping time from polluting the throughput measurement — without it, the auto-adjust would mistake host-idle time for host work and cut the budget incorrectly.
+
+#### State Reset and Cycle Rebasing
+
+```cpp
+RDTSC_rebase();
+CPU_CycleMax = new_cmax;
+// ...
+CPU_IODelayRemoved = 0;
+ticksDone = 0;
+ticksScheduled = 0;
+```
+
+After a full adjustment, all accumulators are reset, starting a fresh 250 ms window. `CPU_IODelayRemoved` is also reset, ensuring I/O delay correction applies only within the current window.
+
+The `RDTSC_rebase()` call adjusts the emulator's internal TSC (Time Stamp Counter) tracking to account for the change in `CPU_CycleMax`. Without this, changing `CPU_CycleMax` mid-execution could cause the fractional millisecond calculation (`PIC_TickIndex()`) to be temporarily inconsistent. The rebase synchronizes the internal counters, making the transition seamless.
+
+#### When Auto-Adjustment is Disabled
+
+If the user set a fixed `cycles=` value, auto-adjustment is turned off (`CPU_CycleAutoAdjust = false`). `increaseticks` still runs on every "nothing due" pass — it still sleeps when no real time has passed, still drains `ticksRemain`, still clamps to the 20-cap — but it never touches `CPU_CycleMax`. The budget remains exactly what the configuration specified. Pacing (guest time tracks wall clock) continues; sizing (budget resize) does not.
+
+### What happens if the game runs too slow?
+"the game runs too slow" means two different things to this controller.
+
+Polarity: increaseticks always pushes host utilization toward ~90%. So the sign of the cycle change is the opposite of "is the host busy or idle," and that's what disambiguates "too slow":
+- Too slow because the host is overloaded (saturated, guest falling behind wall clock): the stall shows up as ticksDone (real ms, minus the sleep-debit so it's productive time) exceeding ticksScheduled (emulated ms drained, capped at 20). ratio at `dosbox.cpp:639` collapses → new_cmax at `dosbox.cpp:665` falls below CPU_CycleMax, applied at `dosbox.cpp:694`. Net: fewer cycles next round. That looks counterintuitive (give a slower game fewer cycles?), but the goal is pacing, not speed: cheaper emulated-ms → host regains 1:1 pacing → the deficit discharges through the 20-capped drain loop at `dosbox.cpp:516-518` rather than growing. The /=3 emergency cut at `dosbox.cpp:718` is the fast path for a >15 ms stall. Negative feedback for real-time tracking.
+- Too slow because the guest is under-clocked on a fast host (host idle, sleeping a lot): the sleep-debit at `dosbox.cpp:605` shrinks ticksDone to near the productive CPU time, while ticksScheduled keeps counting full emulated ms drained → ratio runs high → new_cmax > CPU_CycleMax → more cycles next round, growing ~2× per 250 ms half-blend (`dosbox.cpp:670`) until the host saturates near 90% busy and the sleep-debit makes ratio drop. Negative feedback for game speed.
+
+Both branches are negative feedback — just against the same 90%-utilization setpoint, from opposite sides. The controller cannot actually tell "overloaded" from "under-clocked" directly; both are inferred from the ticksScheduled vs. productive-ticksDone ratio. That's the one systems limitation baked in: if the host is genuinely saturated and even the CPU_CYCLES_LOWER_LIMIT floor (`dosbox.cpp:675`, value 200) can't restore 1:1 pacing, the guest runs permanently under real time (audio stutters — the floor-pinned, under-real-time failure mode in §3.9) and the only real lever left is the user raising CPU_CyclePercUsed via the +/- hotkeys (`cpu.cpp:3337/3372`), which lifts the 90% target itself.
+
+So: read "runs too slow" first against where the host sits relative to the 90% line. Idle side → gets more cycles. Saturated side → gets fewer (and stabilizes, doesn't spiral), exactly because the loop is paced by real time (ticksRemain ≤ 20) and never busy-spins.
+
+### Edge Cases and Gotchas
+
+- **1 ms resolution of `SDL_GetTicks()`** is the reason for the `ticksNew > ticksLast` strict comparison and the sleep-debit. Two samples < 1 ms apart read equal → treated as "no new host time" → sleep. This is also why `ticksDone < 10` (the runaway clamp) and `ticksDone = 1` (`dosbox.cpp:637`) both exist: to avoid division by a sub-resolution denominator.
+
+- **Why `ticksDone` must be signed.** `ticksDone` is `int32_t` (`dosbox.cpp:294`) precisely so the sleep-debit (`dosbox.cpp:605`) can go negative and be clamped at 0 (`dosbox.cpp:607-608`); the ratio path forces `ticksDone >= 1` (`dosbox.cpp:637`). If it were unsigned, the debit would underflow into a huge positive and the controller would think the host was infinitely fast.
+
+- **The `cproc > 0` guard** (`dosbox.cpp:642`) prevents the IO-delay fraction from dividing by zero or by a negative (which can happen mid-debit). If `CPU_CycleMax * ticksScheduled` is 0, the whole correction is skipped and ratio stays at the raw value.
+
+- **Exception safety in the function.** `TIMER_AddTick` (`src/hardware/pic.cpp:854`) can throw `int(1)` for a `time_limit_ms` timeout; that is caught at `dosbox.cpp:553` (`catch(int x)`). `x == 4` (CMOS shutdown) is absorbed with `ret = 0`; anything else is rethrown. `GuestPageFaultException` (CPU decode) is caught at `dosbox.cpp:526` (`catch(const GuestPageFaultException&)`) and converted to a CPU exception. Net: the function is exception-safe — a device callback throwing never leaves `CPU_CycleMax` half-updated, because the write-back at `dosbox.cpp:694` is the only mutation and it is not wrapped.
+
+- **`SDL_Delay` vs busy-loop.** `wrap_delay` in this checkout maps to `SDL_Delay(a)` (`dosbox.cpp:428`); the macro wraps the call site, not a rename. Same primitive: a cooperative 1 ms yield (`wrap_delay(1)` at `dosbox.cpp:586`) to the host scheduler. On a fast host the emulator hands the core back to the OS and wakes once per emulated ms — that is the whole reason a paused or fast-forwarding guest doesn't burn 100% host CPU.
+
+### Summary: The One-Liner
+
+`increaseticks` is DOSBox-X's real-time governor and budget feedback: every time the guest exhausts its per-millisecond decode budget and has no emulated ms due, it samples `SDL_GetTicks()`, turns the real elapsed ms into a bounded (≤20) backlog of `TIMER_AddTick()` calls to drain, and — only in `cycles=auto` — after a ~250 ms window compares "emulated ms scheduled" against "real ms the host actually spent decoding (minus HLT/IO idle)," then half-steps `CPU_CycleMax` toward the throughput-implied target with a 90%-utilization bias, coarse `/= 3` emergency cuts on stalls, and lockout guards so a noisy host scheduler can't hunt the budget. Pacing (does guest time advance?) is its job always; sizing (how much CPU per ms?) is its job only when auto is on.
+
+*Pipeline check-in: the loop from §3.3 is now closed. Host milliseconds feed a cycle budget; the cycle budget is spent by CPU execution; CPU execution produces guest milliseconds; and `increaseticks` is the feedback path that keeps the size of that budget honest against the one real clock available. What remains is what the guest milliseconds are actually *for* — driving virtual hardware — which the next chapter picks up via the event scheduler.*
+
+As one canonical picture of that closed loop, gathering the whole chapter into a single cycle:
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│              HOW GUEST TIME ADVANCES — THE CANONICAL LOOP               │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Host timer fires (GetTicks() reports a new real millisecond)          │
+│            │                                                            │
+│            ▼                                                            │
+│   increaseticks() reconciles: drains due ms, retunes CPU_CycleMax       │
+│   only in cycles=auto (§3.9)                                            │
+│            │                                                            │
+│            ▼                                                            │
+│   TIMER_AddTick() fires: PIC_Ticks increments, CPU_CycleLeft /          │
+│   CPU_Cycles refill to CPU_CycleMax (§3.7)                              │
+│            │                                                            │
+│            ▼                                                            │
+│   Event queue processes anything due at this new PIC_Ticks boundary     │
+│   (@chapter(main-loop-and-event-scheduler))                             │
+│            │                                                            │
+│            ▼                                                            │
+│   Devices observe the new guest time via PIC_FullIndex() (§3.8) and     │
+│   react — PIT reload, VGA retrace, audio fill, and so on                │
+│            │                                                            │
+│            ▼                                                            │
+│   CPU receives a fresh execution budget (CPU_CycleMax cycles) and       │
+│   resumes decoding guest instructions (§3.7)                            │
+│            │                                                            │
+│            └──────────────► back to "Host timer fires"                 │
+│                                                                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Every earlier section in this chapter is an explanation of exactly one arrow in that loop. From here on, any question of the shape "what makes guest time move forward?" has one answer: this loop, running once per reconciled millisecond.
+
+One caveat belongs here rather than earlier, because it only makes sense once the loop above is in view: configuration defines the *target* pace — one guest millisecond per one real millisecond, at whatever cycle density `CPU_CycleMax` currently specifies — but whether that target is actually met depends on host performance. A host that cannot finish the allocated cycle budget before the next real millisecond ticks over falls behind: `ticksRemain` backs up, the 20-ms drain cap (§3.9, Scenario B) starts absorbing the overflow, and in `cycles=auto` mode the feedback law shrinks `CPU_CycleMax` to try to recover 1:1 pacing. If even the cycle floor can't restore it, the guest simply runs slower than real time. This is the practical seed of frame skipping and audio underruns in later chapters: both are downstream consequences of a host failing to sustain the pace the loop above assumes.
+
+---
+
+## 3.10 Overriding the Reconciliation
+
+Two additional mechanisms allow the user to deliberately decouple guest time from host time.
+
+### Turbo Lock
+
+The `ticksLocked` flag is set by `DOSBOX_UnlockSpeed` (`dosbox.cpp:763`, the "speedlock" mapper binding) and by the `turbo` config key. §3.9's Scenario E walked through what happens when it's active — the function's very first branch bypasses wall-clock measurement entirely, forcing `ticksRemain = 5` every pass regardless of what `GetTicks()` actually reads, resetting the auto-adjust accumulators, and returning immediately. Nothing about that mechanism changes here; it's worth returning to only to place it against its counterpart below, and to see the shape of the override at a glance:
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    TURBO MODE SHORT-CIRCUIT                               │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Normal flow:                                                             │
+│  GetTicks() → ticksRemain → reconcile → adjust                           │
+│                                                                            │
+│  Turbo flow:                                                              │
+│  GetTicks() → ticksRemain = 5 (fixed) → reset accumulators → return       │
+│                                                                            │
+│  Effect: Guest time advances as fast as the host CPU and                  │
+│          CPU_CycleMax allow. No synchronization.                          │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+Turbo and the speed-percentage mechanism below share a category — both let the user deliberately break the link between guest time and wall time — but they do it in opposite ways: Turbo discards the wall-clock measurement outright, where speed scaling (next) keeps measuring it and only distorts what it reports.
+
+### Emulator Speed Percentage
+
+A separate mechanism, `emulator_speed` (default 100, adjustable in steps of 5), scales the measured real time before using it:
+
+```cpp
+// src/dosbox.cpp — inside increaseticks(), dosbox.cpp:615
+if (emulator_speed != 100u) {
+    ticksRemain *= emulator_speed;
+    ticksRemain += ticksRemainSpeedFrac;
+    ticksRemainSpeedFrac = ticksRemain % 100u;
+    ticksRemain /= 100u;
+}
+```
+
+Here, the actual elapsed host time (`ticksRemain`) is multiplied by the speed percentage and divided by 100. For example, 50% speed halves the reported elapsed time, making the emulator think less real time has passed, thereby causing it to slow down its guest clock accordingly. Unlike turbo, this still respects the host clock as a reference; it just applies a scale factor, so the emulator remains synchronized but runs at a deliberately slower (or faster) rate.
+
+`ticksRemainSpeedFrac` is not part of `increaseticks()`'s own state (it isn't in the shared-state inventory in §3.9): it's local to this scaling step (`dosbox.cpp:310`), carrying the integer-division remainder from one call to the next so that a non-multiple-of-100 speed setting doesn't lose fractional milliseconds to truncation over time. It modulates how much of `ticksRemain` — the bridge variable the function produces — actually reaches the drain loop (`dosbox.cpp:516-518`); it doesn't feed back into the auto-adjust ratio math at all.
+
+
+---
+
+## 3.11 Why Milliseconds?
+
+All of the time measurements in this chapter—`GetTicks()`, `PIC_Ticks`, and the cycle‑to‑millisecond conversion—are expressed in milliseconds or fractions thereof. This unit was chosen not because of any intrinsic property of the emulated hardware, but because `SDL_GetTicks()` provides millisecond resolution. Using the same unit for both host and guest time simplifies the reconciliation arithmetic.
+
+The emulated PIT, however, operates at a different frequency: it is driven by a 1.193182 MHz clock (derived from the NTSC color subcarrier). The PIT's programmed divisor, often 65536, yields an interrupt rate of about 18.2 Hz. The PIT code in `src/hardware/timer.cpp` converts these hardware‑specific counts into milliseconds using:
+
+```cpp
+delay = ((pic_tickindex_t)(1000ul * cntr_cur)) / PIT_TICK_RATE;
+```
+
+where `PIT_TICK_RATE` is defined as 1193182. This conversion produces a millisecond delay that is then fed into the scheduler. So the PIT's 18.2 Hz is a *device‑level* behavior, built on top of the scheduler's millisecond model—the scheduler does not derive its unit from the PIT.
+
+**Historical context:** The 18.2 Hz timer interrupt is one of the most famous quirks of the IBM PC. IBM chose the maximum 16‑bit divisor (65536, since 0 is treated as the maximum) to minimise timer interrupt overhead. This gave:
+
+```text
+1,193,182 Hz ÷ 65,536 ≈ 18.2065 Hz
+```
+
+This frequency was never a design target—it was simply the slowest the hardware could go. But because the IBM BIOS programmed the PIT this way, and because DOS software came to rely on it, every PC clone and every emulator has faithfully reproduced it for decades. The 18.2 Hz interrupt became a de facto standard, not because anyone chose it, but because changing it would have broken compatibility.
+
+The floating‑point nature of `pic_tickindex_t` (as shown in §3.8) allows sub‑millisecond precision, which is essential for accurately emulating devices that require timings finer than 1 ms (e.g., the PIT's 16‑bit counter, audio sample rates, or CD‑ROM seek delays).
+
+
+---
+
+## 3.12 The Big Picture
+
+The emulator's time model can be viewed as three interdependent layers:
+
+1. **Host wall‑clock time (`GetTicks()`)** — the unchangeable reference. It defines how fast the emulator *should* be running. It is only observed, never modified.
+
+2. **Guest simulated integer time (`PIC_Ticks`)** — a count of completed milliseconds. It is advanced by the CPU cycle budget and is the integer part of the guest timestamp. It is adjusted indirectly via `CPU_CycleMax` changes.
+
+3. **CPU cycle budget (`CPU_CycleMax`, `CPU_CycleLeft`, `CPU_Cycles`)** — the fine‑grained sub‑millisecond accounting. It provides the fractional part of the guest timestamp via `PIC_TickIndex()` and the complete continuous timestamp via `PIC_FullIndex()`. The auto‑adjustment logic tunes this budget to keep layer 2 synchronized with layer 1.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           THE TIMEKEEPING FLOW                            │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│       Host Clock                                                          │
+│       (GetTicks)                                                          │
+│          │                                                                │
+│          │ measures elapsed real time                                     │
+│          ▼                                                                │
+│  ┌──────────────────────┐                                                │
+│  │   increaseticks()    │                                                │
+│  │   reconciliation     │                                                │
+│  └──────────────────────┘                                                │
+│          │                                                                │
+│          │ adjusts CPU_CycleMax                                          │
+│          ▼                                                                │
+│  ┌──────────────────────┐                                                │
+│  │   CPU executes cycle │                                                │
+│  │   budget             │                                                │
+│  └──────────────────────┘                                                │
+│          │                                                                │
+│          │ updates CPU_CycleLeft, CPU_Cycles                             │
+│          ▼                                                                │
+│  ┌──────────────────────┐                                                │
+│  │   PIC_TickIndex()    │                                                │
+│  │   fractional ms      │                                                │
+│  └──────────────────────┘                                                │
+│          │                                                                │
+│          │ + PIC_Ticks                                                   │
+│          ▼                                                                │
+│  ┌──────────────────────┐                                                │
+│  │   PIC_FullIndex()    │                                                │
+│  │   current guest time │                                                │
+│  └──────────────────────┘                                                │
+│          │                                                                │
+│          │ passed to                                                     │
+│          ▼                                                                │
+│  ┌──────────────────────┐                                                │
+│  │   Event Scheduler    │◄────── next chapter                           │
+│  │   (next chapter)     │                                                │
+│  └──────────────────────┘                                                │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The function `increaseticks()` ties these layers together, sleeping when the emulator is ahead and adjusting `CPU_CycleMax` when it is behind, with careful gating to avoid chasing transient load. Turbo and speed scaling are intentional overrides of this reconciliation (§3.10). The full control-system details — the IO-delay correction, the half-step blend, the two-tier regulator with its emergency `/= 3` cut, and the edge cases — are covered in §3.9.4–3.9.6.
+
+**What we've established:** Guest time in DOSBox-X is not stored in a single variable—it is reconstructed on demand from the cycle counters and the completed millisecond count. This design ensures the timestamp and the budget are always in agreement, avoids duplicate state, and naturally handles dynamic changes to the cycle budget.
+
+**Crucially:** Increasing `CPU_CycleMax` does not accelerate the emulator's notion of time directly — `PIC_Ticks` still advances at roughly one guest millisecond per one real millisecond, paced by `increaseticks()` in §3.9, regardless of the budget's size. What a larger budget buys is more guest work completed within that same guest millisecond: more instructions decoded, more device I/O serviced, before the millisecond is called complete. **CPU cycles are execution budget, not a clock** — raising `CPU_CycleMax` raises the guest's effective instruction throughput, not the rate its clock ticks. (The one place this breaks down is a host that can't sustain the larger budget in real time — then guest milliseconds start taking longer than one real millisecond each, and the guest falls *behind* wall-clock time, the opposite of "faster." §3.9 covers exactly this failure mode.)
+
+**The conceptual inversion once more:**
+
+> Unlike a physical IBM PC, where the oscillator determines how many instructions can execute in a unit of time, DOSBox-X starts with a configurable execution budget expressed in guest cycles per host millisecond. Guest time is then reconstructed from the amount of work completed within that budget.
+
+This is why `CPU_CycleMax` is such a fundamental variable: it is the bridge between **host time** and **guest work** — but it's a bridge that sizes the work, not one that reroutes the clock. `increaseticks()` (§3.9) is what keeps the *pacing* of that bridge — guest milliseconds per real second — locked to the host clock; `CPU_CycleMax` only ever governs the *sizing* — how much emulated work each of those milliseconds is allowed to contain.
+
+
+---
+
+## Into the Scheduler
+
+With this foundation in place, the next chapter introduces the main loop and event scheduler. Before handing off, it's worth being explicit about the boundary this chapter has stayed inside: everything above answers what time *means* to DOSBox-X — three coordinates, how they're measured, and how they're kept from drifting apart. None of it has been about *deciding when to stop the CPU and let a device act*. That's a different, and deliberately postponed, question. We're intentionally stopping here.
+
+We now know how DOSBox-X measures guest time:
+
+- `PIC_Ticks` gives the whole milliseconds completed.
+- `CPU_CycleMax`, `CPU_CycleLeft`, and `CPU_Cycles` give the fractional position within the current millisecond.
+- `PIC_FullIndex()` combines them into a continuous timestamp.
+
+We also know how DOSBox-X reconciles guest time against host time:
+
+- `increaseticks()` measures elapsed host time via `GetTicks()`.
+- When the emulator is ahead, it yields the CPU via `SDL_Delay()`.
+- When the emulator is behind, it adjusts `CPU_CycleMax` to increase or decrease the work done per simulated millisecond — the *sizing* of the budget, never the *pacing* of the clock itself.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    WHAT WE KNOW: TIMEKEEPING SUMMARY                     │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  How DOSBox-X measures guest time:                                        │
+│    • PIC_Ticks: whole milliseconds completed                              │
+│    • CPU_CycleMax, CPU_CycleLeft, CPU_Cycles: fractional position        │
+│    • PIC_FullIndex(): continuous guest timestamp                         │
+│                                                                            │
+│  How DOSBox-X reconciles guest time against host time:                    │
+│    • increaseticks(): measures elapsed host time via GetTicks()          │
+│    • Ahead? → SDL_Delay() sleep                                          │
+│    • Behind? → adjust CPU_CycleMax                                       │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+But we have not yet answered the central question that the next chapter addresses:
+
+> **We now know what guest time is—but how does DOSBox-X know exactly when to stop executing the CPU so that a scheduled event can occur?**
+
+The event scheduler uses the relative countdown mechanism (`entry->index = delay + PIC_TickIndex()`, aged by `TIMER_AddTick()`) rather than absolute `PIC_FullIndex()` deadlines. It must decide on every iteration of the main loop:
+
+- How many cycles can we execute before the next event is due?
+- How do we stop execution at precisely the right moment?
+- How do we ensure that events fire in the correct order?
+
+We now understand the three independent notions of time DOSBox-X maintains: host wall-clock time, guest simulated time, and CPU execution budget — and how the last two stay honest against the first. The remaining question is how the emulator puts that machinery to work moment to moment: how it decides, on a single pass through the main loop, when guest time should advance, when a device should react, and how much CPU work is permitted before the next scheduled event. That handoff — a single iteration of the main loop, followed all the way through — is the next chapter's whole subject, and it builds directly on the timekeeping foundation established here.
+
+*Next: @chapter(main-loop-and-event-scheduler) — The Main Loop and Event Scheduler.*
